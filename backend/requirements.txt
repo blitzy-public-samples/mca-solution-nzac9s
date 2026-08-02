@@ -1,0 +1,42 @@
+# Python dependency manifest for the MCA backend.
+# Read by .github/workflows/ci.yml (line 29),
+# infrastructure/docker/Dockerfile.backend (lines 8 and 11) and
+# scripts/setup_environment.sh (line 13).
+# Target runtime: Python 3.9 (ci.yml line 19, Dockerfile.backend line 2).
+# Every distribution is pinned with == because this repository carries no
+# lock file and several pins below encode hard compatibility constraints.
+
+# Web framework
+fastapi==0.99.1           # held below 0.100 to stay inside the Pydantic v1 envelope
+pydantic==1.10.13         # app/core/config.py imports BaseSettings from pydantic (moved out in 2.0)
+python-multipart==0.0.6   # mandatory for UploadFile = File(...) in app/api/attachments.py
+uvicorn==0.23.2           # ASGI server named in Dockerfile.backend line 20
+
+# Persistence
+SQLAlchemy==2.0.23        # app/db/models.py imports UUID from the sqlalchemy root namespace (2.x only)
+psycopg2-binary==2.9.9    # PostgreSQL driver for the postgresql:// DSN and the Cloud SQL instance
+
+# Google Cloud
+google-cloud-storage==2.14.0   # object store behind app/services/storage_service.py
+google-cloud-vision==3.5.0     # OCR client; v2+ exposes vision.Image (vision.types was removed)
+google-cloud-logging==3.9.0    # required by app/core/logging.py
+
+# Task queue
+celery==5.3.4             # app/tasks/celery_tasks.py line 1
+redis==5.0.1              # broker client for the CELERY_BROKER_URL read in app/tasks/celery_tasks.py
+
+# Security
+python-jose[cryptography]==3.3.0   # JWT encoding in app/core/security.py
+passlib[bcrypt]==1.7.4             # password hashing backend in app/core/security.py
+bcrypt==4.3.0                      # passlib 1.7.4 cannot drive bcrypt 5.x: its backend probe
+                                   # calls hashpw() with a >72-byte secret, which 5.0.0 turned
+                                   # into a hard ValueError, so CryptContext(['bcrypt']) raises
+                                   # on first use. 4.3.0 is the newest release passlib supports.
+
+# Utilities
+requests==2.31.0          # app/services/webhook_service.py
+python-dotenv==1.0.0      # backs the env_file setting in app/core/config.py
+
+# Test tooling
+pytest==7.4.4             # invoked by ci.yml line 37
+httpx==0.25.2             # backs the fastapi TestClient used in tests/test_api.py
