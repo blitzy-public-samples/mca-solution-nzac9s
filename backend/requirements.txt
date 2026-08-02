@@ -1,12 +1,21 @@
-# Python dependency manifest for the MCA backend, read by ci.yml line 29,
-# infrastructure/docker/Dockerfile.backend lines 8 and 11, and
-# scripts/setup_environment.sh line 13 - all three already referenced this path
-# correctly, so none of them needed editing. Target runtime: Python 3.9
-# (ci.yml line 19, Dockerfile.backend line 2). Every distribution is pinned with
-# == because this repository carries no lock file and three of the pins below
-# encode hard compatibility constraints. Only direct dependencies appear here:
-# starlette and protobuf resolve transitively, and flake8 is deliberately absent
-# because ci.yml line 46 installs it separately for the lint step.
+# Python dependency manifest for the MCA backend. Target runtime: Python 3.9,
+# declared at ci.yml line 19 and Dockerfile.backend line 2.
+#
+# Consumers. ci.yml line 29 and infrastructure/docker/Dockerfile.backend lines 8
+# and 11 already resolved this path correctly and are left untouched. The third
+# consumer, scripts/setup_environment.sh line 13, asked for a bare cwd-relative
+# "requirements.txt" and so could never reach this file, and it installed through
+# a generic pip3 that on a modern host is not the 3.9 interpreter these pins
+# target. That script now derives the repository root, requires a verified
+# Python 3.9 interpreter, and installs this manifest by an absolute path,
+# aborting the bootstrap when either condition cannot be met.
+#
+# Every record is pinned with == because this repository carries no lock file and
+# several pins encode hard compatibility constraints. The seven groups below are
+# the 17 direct dependencies of app/; the transitive provider block at the end of
+# the file pins only those indirect distributions whose floating versions were
+# measured to break or degrade a direct pin on Python 3.9. flake8 is deliberately
+# absent because ci.yml line 46 installs it separately for the lint step.
 
 # Web framework
 # pydantic MUST stay below 2.0: app/core/config.py line 1 imports BaseSettings from
@@ -33,12 +42,20 @@ google-cloud-vision==3.5.0
 google-cloud-logging==3.9.0    # app/core/logging.py line 2 imports its Client
 
 # Task queue
-celery==5.3.4             # app/tasks/celery_tasks.py line 1
-redis==5.0.1              # broker for CELERY_BROKER_URL at celery_tasks.py line 9
+# The redis extra is named explicitly because celery 5.3.4 publishes its broker
+# provider contract as redis!=4.5.5,<5.0.0,>=4.5.2. Installing celery without the
+# extra hides that contract from the resolver and from pip check while leaving the
+# pair unsupported, so redis is held at the newest release inside the range - a
+# release contemporaneous with celery 5.3.4 that speaks the protocol of the
+# Redis 7 server used as the broker.
+celery[redis]==5.3.4      # app/tasks/celery_tasks.py line 1
+redis==4.6.0              # broker for CELERY_BROKER_URL at celery_tasks.py line 9
 
 # Security
 python-jose[cryptography]==3.3.0   # JWT at security.py line 2; extra adds the crypto
-passlib[bcrypt]==1.7.4             # CryptContext at security.py line 8; extra adds bcrypt
+# The bcrypt extra names passlib's hashing backend but does not bound its version;
+# the release that actually works is pinned in the transitive provider block.
+passlib[bcrypt]==1.7.4             # CryptContext at security.py line 8
 
 # Utilities
 requests==2.31.0          # app/services/webhook_service.py line 1
@@ -47,3 +64,46 @@ python-dotenv==1.0.0      # backs env_file = ".env" at app/core/config.py line 1
 # Test tooling
 pytest==7.4.4             # invoked by ci.yml line 37
 httpx==0.25.2             # backs the FastAPI TestClient at tests/test_api.py line 2
+
+# Transitive providers pinned for determinism
+# Nothing below is imported by app/. Each record pins a provider that one of the
+# direct pins above pulls in but does not constrain tightly enough, and each was
+# measured failing or degrading on a clean Python 3.9 resolution when left to
+# float. Pinning is the gate: with these versions fixed, transitive drift cannot
+# silently reintroduce the failures described here.
+
+# passlib 1.7.4 initialises its bcrypt backend by hashing a 255-byte probe secret
+# and by reading bcrypt.__about__ for the provider version. bcrypt 5.x rejects
+# secrets longer than 72 bytes, so an unbounded passlib[bcrypt] install resolves
+# to 5.0.0 and then raises ValueError on the first CryptContext.hash call at
+# app/core/security.py line 15; bcrypt 4.1 and later removed __about__, which
+# turns that same first call into a trapped traceback. 4.0.1 is the newest release
+# that satisfies both requirements and it ships a cp36-abi3 wheel for 3.9.
+bcrypt==4.0.1
+
+# The Google-published and gRPC-published closure is pinned exactly. Left to
+# float, google-auth 2.46 and later, google-api-core 2.28 and later, and
+# google-cloud-appengine-logging 1.8 and later each emit a FutureWarning on every
+# import announcing that Python 3.9 is past end of life - warnings that reach
+# app/core/logging.py, app/services/ocr_service.py and the storage service, and
+# that are fatal to any caller running with -W error::FutureWarning. These are the
+# newest warning-free releases compatible with the three clients pinned above;
+# google-auth 2.46.0 is additionally yanked upstream and must not be used.
+# grpcio-status stays at 1.62.3 because 1.63 and later require protobuf 5.x, which
+# google-cloud-vision 3.5.0 forbids; grpcio itself stays current because it still
+# publishes cp39 wheels. protobuf is deliberately NOT pinned - AAP section 0.5.2.3
+# prohibits it - and stays inside the 4.x series by the bounds those two records
+# already impose. General-purpose third-party transitives such as starlette,
+# cachetools and rsa are left to the resolver: this manifest is not a lock file.
+google-api-core[grpc]==2.27.0
+google-auth==2.45.0
+google-cloud-appengine-logging==1.7.0
+google-cloud-audit-log==0.6.0
+google-cloud-core==2.5.1
+google-crc32c==1.8.0
+google-resumable-media==2.8.2
+googleapis-common-protos==1.75.0
+grpc-google-iam-v1==0.14.4
+grpcio==1.80.0
+grpcio-status==1.62.3
+proto-plus==1.27.2
