@@ -1,42 +1,49 @@
-# Python dependency manifest for the MCA backend.
-# Read by .github/workflows/ci.yml (line 29),
-# infrastructure/docker/Dockerfile.backend (lines 8 and 11) and
-# scripts/setup_environment.sh (line 13).
-# Target runtime: Python 3.9 (ci.yml line 19, Dockerfile.backend line 2).
-# Every distribution is pinned with == because this repository carries no
-# lock file and several pins below encode hard compatibility constraints.
+# Python dependency manifest for the MCA backend, read by ci.yml line 29,
+# infrastructure/docker/Dockerfile.backend lines 8 and 11, and
+# scripts/setup_environment.sh line 13 - all three already referenced this path
+# correctly, so none of them needed editing. Target runtime: Python 3.9
+# (ci.yml line 19, Dockerfile.backend line 2). Every distribution is pinned with
+# == because this repository carries no lock file and three of the pins below
+# encode hard compatibility constraints. Only direct dependencies appear here:
+# starlette and protobuf resolve transitively, and flake8 is deliberately absent
+# because ci.yml line 46 installs it separately for the lint step.
 
 # Web framework
-fastapi==0.99.1           # held below 0.100 to stay inside the Pydantic v1 envelope
-pydantic==1.10.13         # app/core/config.py imports BaseSettings from pydantic (moved out in 2.0)
-python-multipart==0.0.6   # mandatory for UploadFile = File(...) in app/api/attachments.py
+# pydantic MUST stay below 2.0: app/core/config.py line 1 imports BaseSettings from
+# pydantic, which 2.0 moved out to the separate pydantic-settings package. This pin
+# is what keeps config.py working unedited; fastapi is held below 0.100 to match.
+fastapi==0.99.1
+pydantic==1.10.13
+# python-multipart is mandatory, not optional: app/api/attachments.py line 10
+# declares UploadFile = File(...), and uploads reach FastAPI as form data.
+python-multipart==0.0.6
 uvicorn==0.23.2           # ASGI server named in Dockerfile.backend line 20
 
 # Persistence
-SQLAlchemy==2.0.23        # app/db/models.py imports UUID from the sqlalchemy root namespace (2.x only)
-psycopg2-binary==2.9.9    # PostgreSQL driver for the postgresql:// DSN and the Cloud SQL instance
+# SQLAlchemy MUST be 2.x: app/db/models.py line 1 imports UUID from the sqlalchemy
+# root namespace, which earlier majors do not expose.
+SQLAlchemy==2.0.23
+psycopg2-binary==2.9.9    # driver for the postgresql:// DSN at app/db/database.py:5
 
 # Google Cloud
-google-cloud-storage==2.14.0   # object store behind app/services/storage_service.py
-google-cloud-vision==3.5.0     # OCR client; v2+ exposes vision.Image (vision.types was removed)
-google-cloud-logging==3.9.0    # required by app/core/logging.py
+google-cloud-storage==2.14.0   # the one new distribution; backs storage_service.py
+# google-cloud-vision must be 2.0 or later, where the types and enums submodules
+# were removed: ocr_service.py uses vision.Image, not vision.types.Image.
+google-cloud-vision==3.5.0
+google-cloud-logging==3.9.0    # app/core/logging.py line 2 imports its Client
 
 # Task queue
 celery==5.3.4             # app/tasks/celery_tasks.py line 1
-redis==5.0.1              # broker client for the CELERY_BROKER_URL read in app/tasks/celery_tasks.py
+redis==5.0.1              # broker for CELERY_BROKER_URL at celery_tasks.py line 9
 
 # Security
-python-jose[cryptography]==3.3.0   # JWT encoding in app/core/security.py
-passlib[bcrypt]==1.7.4             # password hashing backend in app/core/security.py
-bcrypt==4.3.0                      # passlib 1.7.4 cannot drive bcrypt 5.x: its backend probe
-                                   # calls hashpw() with a >72-byte secret, which 5.0.0 turned
-                                   # into a hard ValueError, so CryptContext(['bcrypt']) raises
-                                   # on first use. 4.3.0 is the newest release passlib supports.
+python-jose[cryptography]==3.3.0   # JWT at security.py line 2; extra adds the crypto
+passlib[bcrypt]==1.7.4             # CryptContext at security.py line 8; extra adds bcrypt
 
 # Utilities
-requests==2.31.0          # app/services/webhook_service.py
-python-dotenv==1.0.0      # backs the env_file setting in app/core/config.py
+requests==2.31.0          # app/services/webhook_service.py line 1
+python-dotenv==1.0.0      # backs env_file = ".env" at app/core/config.py line 15
 
 # Test tooling
 pytest==7.4.4             # invoked by ci.yml line 37
-httpx==0.25.2             # backs the fastapi TestClient used in tests/test_api.py
+httpx==0.25.2             # backs the FastAPI TestClient at tests/test_api.py line 2
