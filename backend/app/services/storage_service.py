@@ -20,6 +20,7 @@
 # README.md is stale scaffold text with no counterpart in code or Terraform.
 
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -35,9 +36,39 @@ logger = logging.getLogger(__name__)
 
 ATTACHMENT_PREFIX = "attachments"
 
-# Applied when a caller supplies no MIME type, so the stored metadata stays
-# honest about what is actually known about the payload.
+# Applied when a caller supplies no MIME type, and when the one supplied
+# cannot be trusted as metadata (see _resolve_content_type), so the stored
+# metadata stays honest about what is actually known about the payload.
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
+
+# A declared content type is CLIENT TEXT: it arrives as a multipart header
+# or an e-mail part header and is then stored as object metadata that a
+# later reader trusts, so its shape is checked before it is forwarded to the
+# provider. RFC 9110 builds a media type as type/subtype with optional
+# parameters, drawn from one fixed token alphabet plus quoted strings, so
+# anything outside that alphabet - control characters included - is not a
+# media type and has no business being written to an object.
+_MEDIA_TOKEN = r"[0-9A-Za-z!#$%&'*+.^_`|~-]+"
+_MEDIA_QUOTED = r'"[^"\\\x00-\x1f\x7f]*"'
+MEDIA_TYPE_PATTERN = re.compile(
+    "^{0}/{0}(?:[ \t]*;[ \t]*{0}=(?:{0}|{1}))*$".format(
+        _MEDIA_TOKEN, _MEDIA_QUOTED))
+
+# Types a browser EXECUTES rather than displays. Both buckets are private
+# today (infrastructure/terraform/main.tf lines 43-51), but a stored object
+# outlives that decision, and active content served from the bucket's own
+# origin would be a scripting vector rather than a document. Recording such
+# a declaration as an opaque stream keeps the bytes intact and inert.
+ACTIVE_CONTENT_TYPES = frozenset([
+    "application/ecmascript",
+    "application/javascript",
+    "application/x-javascript",
+    "application/xhtml+xml",
+    "image/svg+xml",
+    "text/ecmascript",
+    "text/html",
+    "text/javascript",
+])
 
 # Cloud Storage accepts an object name of 1 to 1024 bytes once UTF-8
 # encoded, and the WHOLE key counts against that - prefix, date partition
@@ -47,6 +78,41 @@ DEFAULT_CONTENT_TYPE = "application/octet-stream"
 # request after the write path has been entered.
 MAX_OBJECT_NAME_BYTES = 1024
 
+# Cloud Storage REFUSES an object name that contains a Carriage Return or a
+# Line Feed, and warns that the control characters XML 1.0 forbids
+# (#x7F-#x84 and #x86-#x9F) break object listing. A filename reaches this
+# module straight out of a multipart header or an e-mail part, which is
+# exactly where such a character enters. That band is taken whole rather than
+# with #x85 punched out of the middle of it, and the remaining C0 controls
+# and the U+2028/U+2029 line separators are folded in as well, because those
+# are the same code points that let caller text forge a second record inside
+# a log line - so ONE set serves both the provider requirement and the
+# log-safety one, and neither can be satisfied while forgetting the other.
+UNSAFE_CODE_POINTS = frozenset(
+    list(range(0x00, 0x20)) + list(range(0x7F, 0xA0)) + [0x2028, 0x2029])
+
+# Substituting rather than deleting keeps the substitution visible in the
+# stored key, and "_" is already what this module puts in place of a path
+# separator, so a sanitised name still reads as one name.
+_CONTROL_TABLE = {code: "_" for code in UNSAFE_CODE_POINTS}
+
+# Ceiling on a single stored object, enforced HERE because this module is the
+# one place every upload passes through: the route at
+# app/api/attachments.py lines 9-17 declares no limit, and neither does
+# anything else in this repository. The figure is not arbitrary - Cloud
+# Vision reads these objects back through get_file_content, and it documents
+# 20 MB as the ceiling for inline content and errors above it, so a larger
+# document could be stored and then never processed. The decimal reading of
+# 20 MB is used because it is the smaller, and therefore the safe, one.
+# Refusing before the write is what bounds how much of this process's memory
+# and of the bucket an unauthenticated caller can spend.
+MAX_UPLOAD_BYTES = 20 * 1000 * 1000
+
+# Read granularity for a streamed body: one mebibyte, which is the point at
+# which Starlette spools a multipart part to disk, so a chunk here is a unit
+# the request machinery already deals in.
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+
 # The two GCS endpoints that address an object as /<bucket>/<object>: on
 # these the first path segment is the bucket and has to be dropped. The
 # other layout this module emits and accepts is virtual-hosted,
@@ -55,6 +121,28 @@ MAX_OBJECT_NAME_BYTES = 1024
 PATH_STYLE_HOSTS = ("storage.googleapis.com", "storage.cloud.google.com")
 
 _client = None
+
+
+def _loggable(value: str) -> str:
+    # Every name this module logs is at least partly CALLER TEXT: the tail of
+    # a generated key is a client filename, and the identifier handed to each
+    # read helper is whatever the caller passed. Writing that verbatim into a
+    # log record would let a crafted value end the line and forge a second
+    # one, so exactly the code points a log consumer could read as a record
+    # boundary are escaped. Everything printable survives, non-ASCII
+    # included, because merchant filenames legitimately carry it and a record
+    # nobody can read is no better than one that lies.
+    #
+    # The rendering is bounded as well. A generated key cannot exceed
+    # MAX_OBJECT_NAME_BYTES, but an identifier arriving from a caller is
+    # under no such limit, and an unbounded one would let a single failed
+    # read write an arbitrarily large record.
+    rendered = "".join(
+        "\\u{0:04x}".format(ord(c)) if ord(c) in UNSAFE_CODE_POINTS else c
+        for c in value[:MAX_OBJECT_NAME_BYTES])
+    if len(value) > MAX_OBJECT_NAME_BYTES:
+        rendered += "...[truncated]"
+    return rendered
 
 
 def _get_client() -> storage.Client:
@@ -90,6 +178,13 @@ def _build_object_name(filename: str) -> str:
     # survives verbatim, because the canonical URL percent-encodes it and
     # _resolve_object_name decodes it back, so the round trip is lossless.
     #
+    # Control code points go in the same pass, per UNSAFE_CODE_POINTS: a
+    # Carriage Return or Line Feed would have the provider reject the upload
+    # outright, and the rest of that set either breaks object listing or
+    # travels on into a log record. Substituting after strip() is what keeps
+    # a name that is merely PADDED with CR, LF or tab from carrying those
+    # positions forward as underscores.
+    #
     # Its LENGTH is untrusted too, and the key leaving here has to be one the
     # provider will accept, so whatever is left of MAX_OBJECT_NAME_BYTES once
     # the fixed part is spent bounds the readable tail. Shortening that tail
@@ -98,6 +193,7 @@ def _build_object_name(filename: str) -> str:
     # while rejecting would cost a merchant a document - or an e-mail poll
     # its whole run - over a filename attribute. The warning keeps it seen.
     safe_name = (filename or "").strip().replace("\\", "/").replace("/", "_")
+    safe_name = safe_name.translate(_CONTROL_TABLE)
     if not safe_name:
         safe_name = "unnamed"
     day = datetime.utcnow().strftime("%Y/%m/%d")
@@ -170,6 +266,66 @@ def _resolve_object_name(file_path: str) -> str:
     return object_name
 
 
+def _resolve_content_type(content_type: Optional[str]) -> str:
+    # The declared type is checked rather than forwarded, for the reason given
+    # at MEDIA_TYPE_PATTERN. A value that is not a well-formed media type is
+    # replaced with the documented fallback instead of refused: the bytes are
+    # still whatever the merchant submitted, and losing a document over a
+    # malformed header would be the worse outcome of the two. The same
+    # substitution is applied to a declaration a browser would execute, per
+    # ACTIVE_CONTENT_TYPES, and only the type itself is inspected - any
+    # parameters ride along with it.
+    #
+    # No allow-list of document types is applied. This application defines no
+    # such policy anywhere, and inventing one here would start refusing the
+    # legitimate statements and contracts the pipeline exists to read.
+    if not content_type:
+        return DEFAULT_CONTENT_TYPE
+    candidate = content_type.strip()
+    if not MEDIA_TYPE_PATTERN.match(candidate):
+        logger.warning(
+            f"Malformed content type {_loggable(candidate)} recorded as "
+            f"{DEFAULT_CONTENT_TYPE}")
+        return DEFAULT_CONTENT_TYPE
+    if candidate.split(";")[0].strip().lower() in ACTIVE_CONTENT_TYPES:
+        logger.warning(
+            f"Active content type {_loggable(candidate)} recorded as "
+            f"{DEFAULT_CONTENT_TYPE}")
+        return DEFAULT_CONTENT_TYPE
+    return candidate
+
+
+async def _read_bounded(file: UploadFile) -> bytes:
+    # Reading the body in chunks and stopping at MAX_UPLOAD_BYTES is what
+    # keeps an upload's cost bounded. `await file.read()` with no argument
+    # materialises the entire body in this process in one go, however large
+    # the client chose to make it, and the route that reaches this module
+    # accepts an arbitrary multipart body, so the size is not something this
+    # module may assume. Refusing here - before upload_attachment is called -
+    # also means an over-sized body never reaches the bucket, so there is no
+    # orphaned object to compensate for afterwards.
+    #
+    # `size` is consulted first only as a shortcut: Starlette sets it from the
+    # bytes it actually spooled rather than from a client header, but it is
+    # absent on a hand-constructed UploadFile, so the loop remains the
+    # authority and the ceiling is never delegated to the attribute alone.
+    declared = getattr(file, "size", None)
+    if isinstance(declared, int) and declared > MAX_UPLOAD_BYTES:
+        raise ValueError(
+            "upload of {0} bytes exceeds the {1} byte limit".format(
+                declared, MAX_UPLOAD_BYTES))
+    body = bytearray()
+    while True:
+        chunk = await file.read(UPLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        body.extend(chunk)
+        if len(body) > MAX_UPLOAD_BYTES:
+            raise ValueError(
+                "upload exceeds the {0} byte limit".format(MAX_UPLOAD_BYTES))
+    return bytes(body)
+
+
 def upload_attachment(
     filename: str,
     file_content: bytes,
@@ -190,19 +346,30 @@ def upload_attachment(
     #
     # An empty payload is a legitimate zero-byte attachment and is uploaded;
     # only None is rejected, and it is rejected before any network call.
+    #
+    # The MAX_UPLOAD_BYTES ceiling is enforced here as well as on the streamed
+    # path, because this is the entry point the e-mail poller uses and its
+    # bytes arrive already materialised - a part decoded from a message is no
+    # more trustworthy in size than a multipart body. Both refusals precede
+    # the key build and the settings read, so an over-sized payload costs one
+    # length comparison and no I/O at all, and the message carries only byte
+    # counts: the filename it came with is caller text and stays out of it.
     if file_content is None:
         raise ValueError("file_content is required to upload an attachment")
+    if len(file_content) > MAX_UPLOAD_BYTES:
+        raise ValueError(
+            "attachment of {0} bytes exceeds the {1} byte limit".format(
+                len(file_content), MAX_UPLOAD_BYTES))
     object_name = _build_object_name(filename)
+    logged = _loggable(object_name)
+    stored_type = _resolve_content_type(content_type)
     blob = _get_bucket().blob(object_name)
     try:
-        blob.upload_from_string(
-            file_content,
-            content_type=content_type or DEFAULT_CONTENT_TYPE,
-        )
+        blob.upload_from_string(file_content, content_type=stored_type)
     except google_exceptions.GoogleAPIError as e:
-        logger.error(f"Failed to upload {object_name}: {str(e)}")
+        logger.error(f"Failed to upload {logged}: {_loggable(str(e))}")
         raise
-    logger.info(f"Uploaded {len(file_content)} bytes to {object_name}")
+    logger.info(f"Uploaded {len(file_content)} bytes to {logged}")
     return blob.public_url
 
 
@@ -214,7 +381,17 @@ async def upload_file(file: UploadFile) -> str:
     # key-building and one error-handling path for both entry points, and
     # FastAPI may leave filename or content_type empty, so both fall through
     # to the defaults applied downstream.
-    file_content = await file.read()
+    #
+    # The body is drawn through _read_bounded rather than by a bare
+    # file.read(), so an unbounded request body cannot be materialised whole
+    # in this process. What this function CANNOT do from here is authenticate
+    # the caller, prove the application exists, or undo a write whose
+    # database row never lands - all three belong to the route at
+    # app/api/attachments.py lines 9-17, which owns the request and the
+    # session; delete_file is already exported for the last of them. This
+    # module bounds what it can bound rather than fabricating a security
+    # boundary it has no position to enforce.
+    file_content = await _read_bounded(file)
     return upload_attachment(file.filename, file_content, file.content_type)
 
 
@@ -230,11 +407,12 @@ def get_file_content(file_path: str) -> bytes:
     # can still tell a NotFound from a transport fault, which a substituted
     # exception would have taken away from it.
     object_name = _resolve_object_name(file_path)
+    logged = _loggable(object_name)
     blob = _get_bucket().blob(object_name)
     try:
         return blob.download_as_bytes()
     except google_exceptions.GoogleAPIError as e:
-        logger.error(f"Failed to download {object_name}: {str(e)}")
+        logger.error(f"Failed to download {logged}: {_loggable(str(e))}")
         raise
 
 
@@ -250,16 +428,17 @@ def delete_file(file_path: str) -> None:
     # and the bucket are looked up, so a None, blank or bucket-only one
     # raises ValueError ahead of any configuration read or network access.
     object_name = _resolve_object_name(file_path)
+    logged = _loggable(object_name)
     blob = _get_bucket().blob(object_name)
     try:
         blob.delete()
     except google_exceptions.NotFound:
-        logger.warning(f"Object already absent, not deleted: {object_name}")
+        logger.warning(f"Object already absent, not deleted: {logged}")
         return
     except google_exceptions.GoogleAPIError as e:
-        logger.error(f"Failed to delete {object_name}: {str(e)}")
+        logger.error(f"Failed to delete {logged}: {_loggable(str(e))}")
         raise
-    logger.info(f"Deleted {object_name}")
+    logger.info(f"Deleted {logged}")
 
 
 def file_exists(file_path: str) -> bool:
@@ -268,11 +447,12 @@ def file_exists(file_path: str) -> bool:
     # 404 into False itself. Genuine transport faults are still logged and
     # re-raised, so an unreachable bucket cannot masquerade as an absent one.
     object_name = _resolve_object_name(file_path)
+    logged = _loggable(object_name)
     blob = _get_bucket().blob(object_name)
     try:
         return bool(blob.exists())
     except google_exceptions.GoogleAPIError as e:
-        logger.error(f"Failed to probe {object_name}: {str(e)}")
+        logger.error(f"Failed to probe {logged}: {_loggable(str(e))}")
         raise
 
 
@@ -307,6 +487,7 @@ def generate_download_url(
     # why the write path returns a canonical URL, which works under the
     # roles/storage.admin grant already in place.
     object_name = _resolve_object_name(file_path)
+    logged = _loggable(object_name)
     blob = _get_bucket().blob(object_name)
     try:
         return blob.generate_signed_url(
@@ -315,5 +496,6 @@ def generate_download_url(
             method="GET",
         )
     except google_exceptions.GoogleAPIError as e:
-        logger.error(f"Failed to sign a URL for {object_name}: {str(e)}")
+        logger.error(
+            f"Failed to sign a URL for {logged}: {_loggable(str(e))}")
         raise
