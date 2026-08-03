@@ -12,8 +12,8 @@
 # interpreter start-up, so the attachment router never registered, the e-mail
 # poller could not be loaded, and OCR could not read a document. The public
 # surface below is therefore fixed BY those call sites - awaitability, arity
-# and return type are contracts rather than choices - which is what lets all
-# three consumers stay byte-identical.
+# and return type are contracts rather than choices - so the three import
+# statements above and the call shapes around them stand unedited.
 #
 # Cloud Storage is the provisioned object store: main.tf declares the target
 # bucket as google_storage_bucket.mca_documents. The AWS S3 named in
@@ -33,21 +33,19 @@ from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Single source of truth for the key namespace, so every object this service
-# writes stays under one prefix that lifecycle rules can target later.
 ATTACHMENT_PREFIX = "attachments"
 
 # Applied when a caller supplies no MIME type, so the stored metadata stays
 # honest about what is actually known about the payload.
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 
-# The endpoints that address an object as /<bucket>/<object>, so their first
-# path segment is the bucket and has to be dropped. Any other host is the
-# virtual-hosted <bucket>.storage.googleapis.com layout, which carries the
-# bucket in the hostname and whose whole path is the object name.
+# The two GCS endpoints that address an object as /<bucket>/<object>: on
+# these the first path segment is the bucket and has to be dropped. The
+# other layout this module emits and accepts is virtual-hosted,
+# <bucket>.storage.googleapis.com, which carries the bucket in the hostname
+# and so keeps its whole path as the object name.
 PATH_STYLE_HOSTS = ("storage.googleapis.com", "storage.cloud.google.com")
 
-# Built on first use, then held for the life of the process; see _get_client.
 _client = None
 
 
@@ -66,9 +64,9 @@ def _get_client() -> storage.Client:
 
 def _get_bucket() -> storage.Bucket:
     # bucket() builds a local reference and performs no existence check, so
-    # every public operation here costs exactly ONE storage round trip rather
-    # than two. Terraform provisions the bucket, not this service, so proving
-    # it exists on each call would buy nothing.
+    # no extra existence-check request is issued ahead of the operation the
+    # caller actually asked for. Terraform provisions the bucket, not this
+    # service, so proving it exists on every call would buy nothing.
     return _get_client().bucket(get_settings().GOOGLE_CLOUD_STORAGE_BUCKET)
 
 
@@ -129,10 +127,11 @@ def upload_attachment(
     content_type: Optional[str] = None,
 ) -> str:
     # Synchronous BY CONTRACT: app/services/email_processor.py line 46 calls
-    # this from a plain def and uses the result on the very next line, so a
-    # coroutine here would persist a coroutine object into storage_url. It is
-    # also called positionally with two arguments there, which is why
-    # content_type carries a default.
+    # this from a plain def and uses the result on the very next line, where
+    # it is recorded as "storage_path" - so a coroutine returned here would
+    # travel on in place of the URL string every downstream consumer expects
+    # and break each of them. It is also called positionally with two
+    # arguments there, which is why content_type carries a default.
     #
     # The value returned is the CANONICAL object URL, never a signed one:
     # storage_url is a non-nullable column (app/db/models.py line 50) whose
@@ -198,9 +197,9 @@ def delete_file(file_path: str) -> None:
     # handler comes first - NotFound is a subclass of GoogleAPIError, so the
     # broader handler would otherwise swallow the idempotent case.
     #
-    # As everywhere here, the identifier is resolved before the bucket is
-    # built, so a caller passing None or a blank string is told exactly that
-    # instead of a configuration error about seven unrelated fields.
+    # As everywhere here, the identifier is validated before the settings
+    # and the bucket are looked up, so a None or blank one raises ValueError
+    # ahead of any configuration read or network access.
     object_name = _resolve_object_name(file_path)
     blob = _get_bucket().blob(object_name)
     try:
@@ -235,18 +234,29 @@ def generate_download_url(
     # Time-limited distribution for read time only, and deliberately NOT on
     # the write path, because a signature expires and storage_url must not.
     #
-    # THIS HELPER HAS AN UNMET INFRASTRUCTURE PREREQUISITE, recorded here so
-    # the gap stays visible rather than latent. A V4 signature needs a
-    # credential that can produce one. The backend runs on Cloud Run
+    # THIS HELPER HAS UNMET PREREQUISITES, recorded here so the gap stays
+    # visible rather than latent. A V4 signature needs a credential that can
+    # produce one, and the backend runs on Cloud Run
     # (infrastructure/terraform/main.tf lines 79-95) under Application
-    # Default Credentials, which supply an access token but NO private key,
-    # so local signing is unavailable. The documented keyless remedy is the
-    # IAM signBlob API, needing the IAM Service Account Credentials API
-    # enabled and roles/iam.serviceAccountTokenCreator granted. main.tf lines
-    # 121-145 grant roles/editor, roles/storage.admin, roles/cloudsql.admin
-    # and roles/pubsub.admin - not the token-creator role - and
-    # infrastructure/terraform/ is out of scope here. Until that grant exists
-    # this call raises, which is why the write path returns a canonical URL.
+    # Default Credentials: an access token, NO private key, so local signing
+    # is unavailable. Two infrastructure prerequisites for the documented
+    # keyless signBlob remedy are BOTH absent - the IAM Service Account
+    # Credentials API is enabled nowhere, the Terraform declaring no
+    # google_project_service at all, and roles/iam.serviceAccountTokenCreator
+    # is not granted: lines 121-145 give mca-service-account roles/editor,
+    # roles/storage.admin, roles/cloudsql.admin and roles/pubsub.admin. That
+    # account is not attached to the Cloud Run service either, which
+    # declares nothing beyond a container image, so the revision runs as the
+    # default compute identity.
+    #
+    # Provisioning both would still not be enough: under
+    # google-cloud-storage 2.14.0 compute credentials are not signing
+    # credentials, so a keyless signature also needs service_account_email
+    # and access_token to be passed, or credentials that can sign in their
+    # place, and the call below passes neither. infrastructure/terraform/ is
+    # out of scope here, so this is reported rather than closed - and it is
+    # why the write path returns a canonical URL, which works under the
+    # roles/storage.admin grant already in place.
     object_name = _resolve_object_name(file_path)
     blob = _get_bucket().blob(object_name)
     try:
