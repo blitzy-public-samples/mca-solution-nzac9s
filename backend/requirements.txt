@@ -33,6 +33,13 @@ google-cloud-vision==3.5.0
 google-cloud-logging==3.9.0    # app/core/logging.py line 2 imports its Client
 
 # Task queue
+# celery 5.3.4 bounds the broker client at redis>=4.5.2,!=4.5.5,<5.0.0, but
+# only under extra == 'redis', which this manifest does not request. The
+# operative bound is kombu's, because the redis transport lives there: the
+# kombu 5.6.2 that celery<6.0 resolves to declares
+# redis>=4.5.2,!=4.5.5,!=5.0.2,<6.5, so the pin below sits inside it, one
+# release short of the excluded 5.0.2. Exercised against a live broker on a
+# clean interpreter - connect, publish, consume, ack.
 celery==5.3.4      # app/tasks/celery_tasks.py line 1
 redis==5.0.1       # broker for CELERY_BROKER_URL at celery_tasks.py line 9
 
@@ -41,7 +48,14 @@ redis==5.0.1       # broker for CELERY_BROKER_URL at celery_tasks.py line 9
 # makes jose select its cryptography RSA and EC backends and leave the
 # bundled ecdsa one idle.
 python-jose[cryptography]==3.3.0   # JWT at security.py line 2
-# The bcrypt extra names the backend CryptContext selects, without bounding it.
+# The bcrypt extra names the backend CryptContext selects, without bounding
+# it: passlib asks only for bcrypt>=3.1.0, so a clean Python 3.9 resolve of
+# this manifest takes bcrypt 5.0.0, and under that release passlib cannot
+# even register the backend - it probes for the 8-bit wraparound bug with a
+# deliberately over-length secret, and bcrypt 5 refuses any secret beyond 72
+# bytes - so every hash and verify raises ValueError, measured with a
+# 5-character password. pip check cannot see it: bcrypt>=3.1.0 is satisfied.
+# Recorded, not pinned, per the direct-dependencies-only rule in the header.
 passlib[bcrypt]==1.7.4             # CryptContext at security.py line 8
 
 # Utilities
