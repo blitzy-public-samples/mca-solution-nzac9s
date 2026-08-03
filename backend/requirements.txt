@@ -2,8 +2,9 @@
 # and Dockerfile.backend line 2 declare, so every pin resolves inside that
 # envelope. Versions are exact because no lock file constrains them, and
 # some pins encode hard compatibility constraints a range would let a
-# resolver violate. Only direct dependencies are declared, across runtime,
-# deployment and test concerns; transitive ones are resolver results.
+# resolver violate. What is declared is what this codebase requires across
+# runtime, deployment and test concerns, plus the one provider bound that an
+# extra leaves open; every other distribution is a resolver result.
 
 # Web framework
 # pydantic MUST stay below 2.0: app/core/config.py line 1 imports
@@ -42,8 +43,20 @@ redis==5.0.1       # broker for CELERY_BROKER_URL at celery_tasks.py line 9
 # makes jose select its cryptography RSA and EC backends and leave the
 # bundled ecdsa one idle.
 python-jose[cryptography]==3.3.0   # JWT at security.py line 2
-# The bcrypt extra names the backend CryptContext selects, without bounding it.
+# The bcrypt extra names the backend CryptContext selects at security.py
+# line 8, but bounds it only at bcrypt>=3.1.0, so a clean resolve takes
+# bcrypt 5.0.0. passlib 1.7.4 finalises that backend by hashing an
+# over-length probe secret, and bcrypt 5 refuses anything past 72 bytes
+# instead of truncating it: pip install and pip check both succeed while
+# the FIRST hash or verify raises ValueError. The pin below therefore
+# narrows passlib's own extra rather than adding a distribution, exactly
+# as the pydantic and SQLAlchemy bounds above narrow theirs. 4.0.1 was
+# measured, not guessed: it is the last release that both accepts the
+# probe and still exposes bcrypt.__about__, which passlib reads at
+# handlers/bcrypt.py line 620, so it is the only candidate that also
+# starts up without a trapped AttributeError traceback.
 passlib[bcrypt]==1.7.4             # CryptContext at security.py line 8
+bcrypt==4.0.1                      # provider of the passlib extra above
 
 # Utilities
 requests==2.31.0       # app/services/webhook_service.py line 1
