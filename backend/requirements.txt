@@ -2,8 +2,8 @@
 # and Dockerfile.backend line 2 declare, so every pin resolves inside that
 # envelope. Versions are exact because no lock file constrains them, and
 # some pins encode hard compatibility constraints a range would let a
-# resolver violate. Direct dependencies span runtime, deployment and test
-# concerns; transitive ones are resolver results, bar the one bounded below.
+# resolver violate. Only direct dependencies are declared, across runtime,
+# deployment and test concerns; transitive ones are resolver results.
 
 # Web framework
 # pydantic MUST stay below 2.0: app/core/config.py line 1 imports
@@ -41,14 +41,8 @@ redis==5.0.1       # broker for CELERY_BROKER_URL at celery_tasks.py line 9
 # makes jose select its cryptography RSA and EC backends and leave the
 # bundled ecdsa one idle.
 python-jose[cryptography]==3.3.0   # JWT at security.py line 2
-# The bcrypt extra names the hashing backend CryptContext selects but bounds
-# it only at >=3.1.0, so a clean resolution took bcrypt 5.0.0 and the first
-# hash raised: passlib 1.7.4 finalises this backend against a 255-byte probe
-# secret that 5.x rejects above 72 bytes. 4.0.1 is the last release that
-# accepts that probe and still exposes __about__, so backend selection
-# neither raises nor logs a trapped traceback.
+# The bcrypt extra names the backend CryptContext selects, without bounding it.
 passlib[bcrypt]==1.7.4             # CryptContext at security.py line 8
-bcrypt==4.0.1                      # backend passlib selects at security.py:8
 
 # Utilities
 requests==2.31.0       # app/services/webhook_service.py line 1

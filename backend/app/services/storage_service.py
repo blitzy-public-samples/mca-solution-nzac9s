@@ -24,11 +24,15 @@
 import logging
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional
-from urllib.parse import unquote, urlparse
+from typing import Dict, Optional
+from urllib.parse import ParseResult, unquote, urlparse
 
+import google.auth
 from fastapi import UploadFile
 from google.api_core import exceptions as google_exceptions
+from google.auth import credentials as google_auth_credentials
+from google.auth import exceptions as google_auth_exceptions
+from google.auth.transport import requests as google_auth_transport
 from google.cloud import storage
 
 from app.core.config import get_settings
@@ -36,7 +40,9 @@ from app.core.config import get_settings
 logger = logging.getLogger(__name__)
 
 # Single source of truth for the key namespace, so every object this service
-# writes stays under one prefix that lifecycle rules can target later.
+# writes stays under one prefix that lifecycle rules can target later. It is
+# also the namespace an identifier must fall inside to be resolvable: see
+# _resolve_object_name.
 ATTACHMENT_PREFIX = "attachments"
 
 # Cloud Storage wants a content type on write, and both e-mail parts and
@@ -44,9 +50,58 @@ ATTACHMENT_PREFIX = "attachments"
 # than guessing a type the bytes may not actually have.
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 
+# Cloud Storage refuses an object name longer than 1024 UTF-8 bytes, so a
+# supplied filename may only occupy what the prefix, the date partition and
+# the UUID leave behind. Enforced on the way in by _build_object_name and on
+# the way back by _resolve_object_name.
+MAX_OBJECT_NAME_BYTES = 1024
+
+# A V4 signature is valid for at most seven days. Naming the ceiling here
+# lets generate_download_url refuse an impossible window before it resolves
+# credentials, rather than letting the client raise after that work is done.
+MAX_EXPIRATION_MINUTES = 7 * 24 * 60
+
+# Control characters are excluded from object names on two independent
+# grounds: Cloud Storage rejects carriage return and line feed outright, and
+# either one carried into a log record could forge a second record there
+# (CWE-117). C0, DEL and C1 are all covered; printable non-ASCII is
+# deliberately left alone, because filenames legitimately contain it.
+CONTROL_CHARACTERS = frozenset(
+    chr(code) for code in list(range(0x00, 0x20)) + list(range(0x7F, 0xA0))
+)
+
+# The only origins an identifier may name. Cloud Storage publishes two
+# endpoint layouts per host - path-style, which carries the bucket as the
+# first path segment, and virtual-hosted, which carries it as a hostname
+# prefix - and both are accepted for these hosts alone. Anything else is a
+# foreign origin, and is refused rather than quietly re-pointed at our own
+# bucket: see _bucket_relative_path.
+GCS_ENDPOINT_HOSTS = ("storage.googleapis.com", "storage.cloud.google.com")
+
+# Scope requested for the identity that signs download URLs. cloud-platform
+# is what authorises the IAM signBlob call described in _get_signing_kwargs.
+SIGNING_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
+
 # Cached client handle; stays None until the first storage operation runs.
 # See _get_client for why that emptiness at import time is the whole point.
 _client = None
+
+# Cached signing identity, resolved only when generate_download_url runs and
+# empty until then, for the same import-time reason as _client above.
+_signing_credentials = None
+
+
+def _log_safe(value: str) -> str:
+    # Escapes anything that could break out of a single log record before it
+    # is interpolated into one. Both name producers below already refuse
+    # control characters, so this is the second line of defence rather than
+    # the first - but a log file is the wrong place to discover that the
+    # first one was bypassed, because a forged record is indistinguishable
+    # from a genuine one after the fact (CWE-117).
+    return "".join(
+        "\\x{0:02x}".format(ord(char)) if char in CONTROL_CHARACTERS else char
+        for char in value
+    )
 
 
 def _get_client() -> storage.Client:
@@ -77,19 +132,92 @@ def _build_object_name(filename: str) -> str:
     # The uuid4 prefix is what makes key collisions structurally impossible:
     # two uploads of the same filename on the same day cannot overwrite one
     # another. utcnow() rather than now() matches the UTC-only convention
-    # used at every other timestamp site in this backend. Separators in the
-    # supplied name are flattened so that a traversal attempt such as
-    # "a/b/evil.pdf" lands at "a_b_evil.pdf" and cannot escape the prefix,
-    # and a missing name becomes "unnamed" rather than an empty key.
-    # Non-ASCII characters are kept verbatim: the canonical URL percent-
-    # encodes them and _resolve_object_name decodes them on the way back.
-    safe_name = (filename or "").strip().replace("\\", "/").replace("/", "_")
+    # used at every other timestamp site in this backend.
+    #
+    # The filename itself arrives from an e-mail part or a browser upload and
+    # is therefore untrusted, so three things happen to it before any of it
+    # becomes a key. Separators are flattened, so a traversal attempt such as
+    # "a/b/evil.pdf" lands at "a_b_evil.pdf" and cannot escape the prefix.
+    # Control characters are replaced, because Cloud Storage rejects carriage
+    # return and line feed in an object name and either one would otherwise
+    # travel into the log line in upload_attachment. What survives is then
+    # trimmed to whatever the 1024-byte name limit leaves after the prefix,
+    # the date and the UUID, cut on a UTF-8 boundary so that a multi-byte
+    # character is never split into an invalid fragment. A missing name
+    # becomes "unnamed" rather than an empty key.
+    #
+    # Printable non-ASCII survives all three unchanged: the canonical URL
+    # percent-encodes it and _resolve_object_name decodes it on the way back,
+    # so the round trip stays lossless.
+    stem = "{0}/{1}/{2}-".format(
+        ATTACHMENT_PREFIX,
+        datetime.utcnow().strftime("%Y/%m/%d"),
+        uuid.uuid4().hex,
+    )
+    flattened = (filename or "").strip().replace("\\", "/").replace("/", "_")
+    safe_name = "".join(
+        "_" if char in CONTROL_CHARACTERS else char for char in flattened
+    ).strip()
     if not safe_name:
         safe_name = "unnamed"
-    day = datetime.utcnow().strftime("%Y/%m/%d")
-    return "{0}/{1}/{2}-{3}".format(
-        ATTACHMENT_PREFIX, day, uuid.uuid4().hex, safe_name
-    )
+    budget = MAX_OBJECT_NAME_BYTES - len(stem.encode("utf-8"))
+    encoded_name = safe_name.encode("utf-8")
+    if len(encoded_name) > budget:
+        safe_name = encoded_name[:budget].decode("utf-8", "ignore")
+    return stem + safe_name
+
+
+def _bucket_relative_path(parsed: ParseResult, candidate: str) -> str:
+    # Reduces a URI form to the still-encoded object path it addresses, and
+    # refuses anything this service could not have emitted.
+    #
+    # The identifier reaching get_file_content and its siblings arrives from
+    # the storage_url column, so it deserves exactly as much trust as any
+    # other request input: none. A resolver that inspected only the scheme
+    # would happily reduce gs://someone-elses-bucket/attachments/x, or
+    # https://example.com/anything/attachments/x, to a name inside OUR bucket
+    # and then read, delete, probe or sign that object instead. So the origin
+    # is checked against the two published Cloud Storage endpoint layouts and
+    # the bucket the identifier names must be the configured one - both here,
+    # before any network call is made.
+    #
+    # urlparse has already separated the query string, which is how a signed
+    # URL's X-Goog-* parameters get discarded. The path stays percent-encoded
+    # for now so that an encoded separator cannot masquerade as a real one
+    # while the bucket segment is removed; _resolve_object_name decodes it
+    # once that segment is gone.
+    scheme = parsed.scheme.lower()
+    host = parsed.netloc.lower()
+    path = parsed.path.lstrip("/")
+    bucket_name = get_settings().GOOGLE_CLOUD_STORAGE_BUCKET
+    if scheme == "gs":
+        if host != bucket_name.lower():
+            raise ValueError(
+                "file_path names bucket '{0}', not the configured "
+                "bucket: {1}".format(host, _log_safe(candidate)))
+        return path
+    if scheme != "https":
+        raise ValueError(
+            "file_path uses unsupported scheme '{0}': {1}".format(
+                scheme, _log_safe(candidate)))
+    if host in GCS_ENDPOINT_HOSTS:
+        # Path-style: the bucket is the first path segment and has to go,
+        # but only once it has been confirmed to be ours.
+        first, separator, remainder = path.partition("/")
+        if first != bucket_name or not separator:
+            raise ValueError(
+                "file_path names bucket '{0}', not the configured "
+                "bucket: {1}".format(first, _log_safe(candidate)))
+        return remainder
+    for endpoint in GCS_ENDPOINT_HOSTS:
+        # Virtual-hosted: the bucket is a hostname prefix instead, so the
+        # path already IS the object name and stripping a segment from it
+        # would corrupt the name.
+        if host == "{0}.{1}".format(bucket_name.lower(), endpoint):
+            return path
+    raise ValueError(
+        "file_path is not a Cloud Storage identifier for the configured "
+        "bucket: {0}".format(_log_safe(candidate)))
 
 
 def _resolve_object_name(file_path: str) -> str:
@@ -100,39 +228,110 @@ def _resolve_object_name(file_path: str) -> str:
     # get_file_content - so EVERY emitted form has to reduce to the same
     # bucket-relative object name. If it did not, an upload would succeed and
     # the matching download would 404, a silent failure no import test can
-    # see. Bare object names are accepted unchanged for the same reason.
+    # see. Bare object names, with or without a leading slash, are accepted
+    # for the same reason.
+    #
+    # What is NOT accepted is anything this service could not have emitted.
+    # _bucket_relative_path settles the origin and the bucket; the checks
+    # below settle the name itself, on the DECODED form so that an encoded
+    # traversal such as %2E%2E%2F is inspected as the "../" it really is.
+    # Every key this module writes lives under ATTACHMENT_PREFIX, so a name
+    # outside that namespace, a relative or empty segment, a control
+    # character or an over-long name is refused here rather than turned into
+    # a read, a deletion, a probe or a signature over an unintended object.
     if file_path is None:
         raise ValueError("file_path is required to address an object")
     candidate = str(file_path).strip()
     if not candidate:
         raise ValueError("file_path must not be empty")
     parsed = urlparse(candidate)
-    scheme = parsed.scheme.lower()
-    if scheme in ("gs", "http", "https"):
-        # urlparse has already dropped the query string, which is how a
-        # signed URL's X-Goog-* credentials get discarded. The raw path is
-        # split before unquoting so that an encoded separator cannot
-        # masquerade as a real one.
-        path = parsed.path.lstrip("/")
-        if scheme != "gs":
-            # Path-style URLs carry the bucket as the first path segment and
-            # it has to go. The virtual-hosted layout carries the bucket in
-            # the hostname instead, so there the path already IS the object
-            # name and stripping a segment would corrupt it.
-            virtual_hosted = parsed.netloc.lower().endswith(
-                (".storage.googleapis.com", ".storage.cloud.google.com")
-            )
-            if not virtual_hosted:
-                path = path.partition("/")[2]
+    if parsed.scheme:
+        path = _bucket_relative_path(parsed, candidate)
     else:
-        # A bare object name, with or without a leading slash.
         path = candidate.lstrip("/")
     object_name = unquote(path)
-    if not object_name:
+    if not object_name.startswith(ATTACHMENT_PREFIX + "/"):
         raise ValueError(
-            "file_path does not address an object: {0}".format(candidate)
-        )
+            "file_path does not address an object under '{0}/': {1}".format(
+                ATTACHMENT_PREFIX, _log_safe(candidate)))
+    segments = object_name.split("/")
+    if any(not segment or segment in (".", "..") for segment in segments):
+        raise ValueError(
+            "file_path has an empty or relative path segment: {0}".format(
+                _log_safe(candidate)))
+    if any(char in CONTROL_CHARACTERS for char in object_name):
+        raise ValueError(
+            "file_path has control characters: {0}".format(
+                _log_safe(candidate)))
+    if len(object_name.encode("utf-8")) > MAX_OBJECT_NAME_BYTES:
+        raise ValueError(
+            "file_path exceeds the {0}-byte object name limit".format(
+                MAX_OBJECT_NAME_BYTES))
     return object_name
+
+
+def _get_signing_kwargs() -> Dict[str, object]:
+    # Produces the keyword arguments generate_download_url must hand the
+    # client for a V4 signature to be produced AT ALL on this deployment.
+    #
+    # Signing needs something that can produce a signature, and here that is
+    # not a private key. The backend runs on Cloud Run
+    # (infrastructure/terraform/main.tf lines 79-95) under Application
+    # Default Credentials, which return an access token and nothing else: the
+    # credential is not an instance of google.auth.credentials.Signing, so
+    # asking the client to sign locally raises AttributeError inside
+    # google/cloud/storage/_signing.py instead of returning a URL.
+    #
+    # The supported keyless route is the IAM signBlob API, and the pinned
+    # client takes it only when BOTH service_account_email and access_token
+    # are supplied - which is what this helper supplies. The credential is
+    # refreshed first for two reasons: the token has to be current, and a
+    # compute-engine credential reports its service_account_email as the
+    # literal string "default" until the metadata server has answered. A
+    # credential that CAN sign locally, such as a service-account key or an
+    # impersonated identity, is passed through untouched instead, so a
+    # deployment that grows a signing key needs no change here.
+    #
+    # STILL AN UNMET INFRASTRUCTURE PREREQUISITE: signBlob requires the IAM
+    # Service Account Credentials API to be enabled and the role
+    # roles/iam.serviceAccountTokenCreator to be granted to
+    # mca-service-account. main.tf lines 116-146 grant roles/editor,
+    # roles/storage.admin, roles/cloudsql.admin and roles/pubsub.admin only,
+    # so until the Terraform grants that role this path fails at the signBlob
+    # call with a logged TransportError - loudly, at read time, with a
+    # message that names the cause. That gap is exactly why the upload path
+    # returns the canonical object URL, which needs nothing beyond the
+    # storage role already granted, and why that canonical URL is what lands
+    # in the non-nullable storage_url column.
+    global _signing_credentials
+    if _signing_credentials is None:
+        try:
+            _signing_credentials, _ = google.auth.default(
+                scopes=list(SIGNING_SCOPES))
+        except google_auth_exceptions.GoogleAuthError as e:
+            logger.error(f"Failed to resolve signing credentials: {str(e)}")
+            raise
+    if isinstance(_signing_credentials, google_auth_credentials.Signing):
+        return {"credentials": _signing_credentials}
+    try:
+        _signing_credentials.refresh(google_auth_transport.Request())
+    except google_auth_exceptions.GoogleAuthError as e:
+        logger.error(f"Failed to refresh signing credentials: {str(e)}")
+        raise
+    email = getattr(_signing_credentials, "service_account_email", None)
+    token = getattr(_signing_credentials, "token", None)
+    if not email or email == "default" or not token:
+        message = (
+            "The active credentials cannot sign a download URL: they carry "
+            "no private key and no service account identity for the IAM "
+            "signBlob API")
+        logger.error(message)
+        raise google_auth_exceptions.GoogleAuthError(message)
+    return {
+        "credentials": _signing_credentials,
+        "service_account_email": email,
+        "access_token": token,
+    }
 
 
 def upload_attachment(
@@ -166,10 +365,12 @@ def upload_attachment(
         )
     except google_exceptions.GoogleAPIError as e:
         logger.error(
-            f"Failed to upload {object_name} to {bucket.name}: {str(e)}")
+            f"Failed to upload {_log_safe(object_name)} to "
+            f"{bucket.name}: {str(e)}")
         raise
     logger.info(
-        f"Uploaded {len(file_content)} bytes to {bucket.name}/{object_name}")
+        f"Uploaded {len(file_content)} bytes to "
+        f"{bucket.name}/{_log_safe(object_name)}")
     return blob.public_url
 
 
@@ -200,11 +401,13 @@ def get_file_content(file_path: str) -> bytes:
         return blob.download_as_bytes()
     except google_exceptions.NotFound as e:
         logger.error(
-            f"Object {object_name} not found in {bucket.name}: {str(e)}")
+            f"Object {_log_safe(object_name)} not found in "
+            f"{bucket.name}: {str(e)}")
         raise
     except google_exceptions.GoogleAPIError as e:
         logger.error(
-            f"Failed to download {object_name} from {bucket.name}: {str(e)}")
+            f"Failed to download {_log_safe(object_name)} from "
+            f"{bucket.name}: {str(e)}")
         raise
 
 
@@ -220,13 +423,15 @@ def delete_file(file_path: str) -> None:
         blob.delete()
     except google_exceptions.NotFound:
         logger.warning(
-            f"Object {object_name} already absent from {bucket.name}")
+            f"Object {_log_safe(object_name)} already absent from "
+            f"{bucket.name}")
         return
     except google_exceptions.GoogleAPIError as e:
         logger.error(
-            f"Failed to delete {object_name} from {bucket.name}: {str(e)}")
+            f"Failed to delete {_log_safe(object_name)} from "
+            f"{bucket.name}: {str(e)}")
         raise
-    logger.info(f"Deleted {object_name} from {bucket.name}")
+    logger.info(f"Deleted {_log_safe(object_name)} from {bucket.name}")
 
 
 def file_exists(file_path: str) -> bool:
@@ -243,7 +448,8 @@ def file_exists(file_path: str) -> bool:
         return False
     except google_exceptions.GoogleAPIError as e:
         logger.error(
-            f"Failed to probe {object_name} in {bucket.name}: {str(e)}")
+            f"Failed to probe {_log_safe(object_name)} in "
+            f"{bucket.name}: {str(e)}")
         raise
 
 
@@ -252,24 +458,22 @@ def generate_download_url(
     expiration_minutes: int = 15,
 ) -> str:
     # Time-limited distribution for read time only; deliberately NOT on the
-    # write path.
+    # write path, because a signature expires and storage_url must not.
+    # _get_signing_kwargs carries the full account of how signing is wired on
+    # this deployment and which infrastructure grant it still waits on.
     #
-    # PREREQUISITE, NOT CURRENTLY PROVISIONED: V4 signing needs a credential
-    # that can produce a signature. This backend runs on Cloud Run
-    # (infrastructure/terraform/main.tf lines 79-95) under Application
-    # Default Credentials, which supply an access token but NO private key,
-    # and no service-account key file is deployed. The keyless alternative is
-    # the IAM Service Account Credentials API, which requires that API to be
-    # enabled and the role roles/iam.serviceAccountTokenCreator to be granted
-    # to mca-service-account; main.tf lines 116-146 grant roles/editor,
-    # roles/storage.admin, roles/cloudsql.admin and roles/pubsub.admin only.
-    # NEITHER prerequisite exists today, so this call raises until the
-    # Terraform grants them. That gap is exactly why upload_attachment
-    # returns the canonical object URL instead of a signed one, and why that
-    # canonical URL is what lands in the non-nullable storage_url column.
-    if expiration_minutes <= 0:
-        raise ValueError("expiration_minutes must be a positive integer")
+    # The window is validated before anything else because a V4 signature is
+    # capped at seven days and the client discovers an over-long one only
+    # after credentials have been resolved and a bucket reference built.
+    # Refusing it here keeps an impossible request cheap and its error
+    # specific, and it is the same argument-before-I/O rule the rest of this
+    # module follows.
+    if expiration_minutes < 1 or expiration_minutes > MAX_EXPIRATION_MINUTES:
+        raise ValueError(
+            "expiration_minutes must be between 1 and {0}".format(
+                MAX_EXPIRATION_MINUTES))
     object_name = _resolve_object_name(file_path)
+    signing_kwargs = _get_signing_kwargs()
     bucket = _get_bucket()
     blob = bucket.blob(object_name)
     try:
@@ -277,8 +481,16 @@ def generate_download_url(
             version="v4",
             expiration=timedelta(minutes=expiration_minutes),
             method="GET",
+            **signing_kwargs
         )
-    except google_exceptions.GoogleAPIError as e:
+    except (
+        google_auth_exceptions.GoogleAuthError,
+        google_exceptions.GoogleAPIError,
+    ) as e:
+        # Both families are expected here and neither is swallowed: an
+        # unauthorised signBlob call arrives as a GoogleAuthError, while a
+        # storage-side fault arrives as a GoogleAPIError.
         logger.error(
-            f"Failed to sign a download URL for {object_name}: {str(e)}")
+            f"Failed to sign a download URL for "
+            f"{_log_safe(object_name)}: {str(e)}")
         raise
