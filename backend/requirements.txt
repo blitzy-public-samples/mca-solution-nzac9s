@@ -2,8 +2,10 @@
 # and Dockerfile.backend line 2 declare, so every pin resolves inside that
 # envelope. Versions are exact because no lock file constrains them, and
 # some pins encode hard compatibility constraints a range would let a
-# resolver violate. Only direct dependencies are declared, across runtime,
-# deployment and test concerns; transitive ones are resolver results.
+# resolver violate. What is declared is the direct dependencies across
+# runtime, deployment and test concerns, plus one provider - bcrypt, in
+# the Security group - whose own declared range admits a release that
+# breaks the package requesting it. Everything else is a resolver result.
 
 # Web framework
 # pydantic MUST stay below 2.0: app/core/config.py line 1 imports
@@ -48,15 +50,22 @@ redis==5.0.1       # broker for CELERY_BROKER_URL at celery_tasks.py line 9
 # makes jose select its cryptography RSA and EC backends and leave the
 # bundled ecdsa one idle.
 python-jose[cryptography]==3.3.0   # JWT at security.py line 2
-# The bcrypt extra names the backend CryptContext selects, without bounding
-# it: passlib asks only for bcrypt>=3.1.0, so a clean Python 3.9 resolve of
-# this manifest takes bcrypt 5.0.0, and under that release passlib cannot
-# even register the backend - it probes for the 8-bit wraparound bug with a
-# deliberately over-length secret, and bcrypt 5 refuses any secret beyond 72
-# bytes - so every hash and verify raises ValueError, measured with a
-# 5-character password. pip check cannot see it: bcrypt>=3.1.0 is satisfied.
-# Recorded, not pinned, per the direct-dependencies-only rule in the header.
+# The bcrypt extra names the backend CryptContext selects, but bounds it
+# only at bcrypt>=3.1.0, so the provider cannot be left to the resolver: a
+# clean Python 3.9 resolve of this manifest takes bcrypt 5.0.0, and under
+# that release passlib cannot even register the backend. It finalises it by
+# hashing a deliberately over-length secret to probe for the 8-bit
+# wraparound bug, and bcrypt 5 refuses any secret beyond 72 bytes, so the
+# FIRST hash or verify raises ValueError - measured with a 5-character
+# password. pip check is blind to it, because bcrypt>=3.1.0 is satisfied,
+# which is why the bound belongs in the manifest rather than in a comment.
 passlib[bcrypt]==1.7.4             # CryptContext at security.py line 8
+# 4.0.1 is the last release that both accepts passlib's over-length probe
+# and still exposes bcrypt.__about__, which passlib 1.7.4 reads for the
+# provider version. Both candidates were measured on virgin 3.9 venvs:
+# 4.0.1 hashes and verifies with zero bytes on stderr, while 4.3.0 works
+# but writes a trapped AttributeError traceback there on every start-up.
+bcrypt==4.0.1                      # provider of the extra on the line above
 
 # Utilities
 requests==2.31.0       # app/services/webhook_service.py line 1
