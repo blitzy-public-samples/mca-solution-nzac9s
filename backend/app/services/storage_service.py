@@ -144,6 +144,15 @@ def _resolve_object_name(file_path: str) -> str:
     # reporting it as a provider fault far from the caller that supplied it.
     # The normalised name is therefore checked once, after every branch, and
     # refused here - the same contract the None and blank inputs carry.
+    #
+    # THAT REFUSAL NAMES NO PART OF THE IDENTIFIER, which is a safety
+    # property rather than terseness. A bucket-only form can arrive as a
+    # signed URL, whose query IS authentication material - X-Goog-Credential
+    # and X-Goog-Signature - and whose text may carry control characters
+    # able to forge log records once an upstream FastAPI or Celery handler
+    # writes the exception out. Echoing the value back would hand both to
+    # that log for nothing: the caller already holds what it passed, and no
+    # provider operation has been spent to learn more about it than that.
     if file_path is None or not file_path.strip():
         raise ValueError("file_path is required to address a stored object")
     candidate = file_path.strip()
@@ -157,8 +166,7 @@ def _resolve_object_name(file_path: str) -> str:
             path = path.partition("/")[2]
         object_name = unquote(path)
     if not object_name:
-        raise ValueError(
-            f"file_path addresses no object in the bucket: {candidate}")
+        raise ValueError("file_path addresses no object in the bucket")
     return object_name
 
 
