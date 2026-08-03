@@ -1,19 +1,15 @@
-# Python dependency manifest for the MCA backend, read by ci.yml line 29,
-# infrastructure/docker/Dockerfile.backend lines 8 and 11, and
-# scripts/setup_environment.sh line 13. All three already reference this path, so
-# creating this file repairs all three and none of them is edited.
-# Target runtime: Python 3.9, declared at ci.yml line 19 and
-# Dockerfile.backend line 2 - declarations this change does not touch, so every
-# record below has to resolve inside that envelope.
-# Every record uses == because this repository carries no lock file and several
-# of them encode hard compatibility constraints that a range would let a future
-# resolver violate. The seven groups below are the 17 direct dependencies of
-# app/. The pinned-provider block at the end adds the four indirect
-# distributions whose floating versions were each MEASURED to break or degrade a
-# direct record on Python 3.9; nothing is pinned there that a clean resolution
-# already selects unaided. starlette and protobuf stay resolver results, and
-# flake8 is deliberately absent because ci.yml line 46 installs it separately
-# for the lint step.
+# Python dependency manifest for the MCA backend, already referenced by ci.yml
+# line 29, infrastructure/docker/Dockerfile.backend lines 8 and 11, and
+# scripts/setup_environment.sh line 13, so creating it repairs all three
+# consumers and none of them is edited. Target runtime: Python 3.9, declared at
+# ci.yml line 19 and Dockerfile.backend line 2, so every pin below has to resolve
+# inside that envelope. Each pin uses == because this repository carries no lock
+# file and three of them encode hard compatibility constraints that a range would
+# let a future resolver violate. The seven groups below are the 17 direct
+# dependencies of app/ and nothing else: starlette, protobuf, bcrypt,
+# google-api-core and every other indirect distribution stays a resolver result
+# rather than a declaration, and flake8 is deliberately absent because ci.yml
+# line 46 installs it separately for the lint step.
 
 # Web framework
 # pydantic MUST stay below 2.0: app/core/config.py line 1 imports BaseSettings from
@@ -38,27 +34,28 @@ google-cloud-storage==2.14.0   # the one new distribution; backs storage_service
 # were removed: ocr_service.py uses vision.Image, not vision.types.Image.
 google-cloud-vision==3.5.0
 google-cloud-logging==3.9.0    # app/core/logging.py line 2 imports its Client
+# google-api-core, google-auth and google-cloud-appengine-logging arrive through
+# the three clients above. Releases of them published after Python 3.9 reached
+# end of life add an informational FutureWarning to these imports, which is why
+# the closure is left to the resolver instead of bounded here.
 
 # Task queue
-# The redis extra is named explicitly: celery publishes its broker provider
-# bound ONLY under extra == 'redis', so declaring bare celery hides that
-# bound from the resolver and from pip check, which then report a false green on
-# a pair the vendor does not support: celery 5.3.4 bounds the broker at
-# redis!=4.5.5,<5.0.0,>=4.5.2, so celery[redis]==5.3.4 with redis 5.0.1 is
-# ResolutionImpossible. celery 5.3.5 raised that ceiling to <6.0.0, so the pair
-# moves FORWARD to the terminal 5.3.x release instead of downgrading the broker
-# client a whole major version: redis stays at 5.0.1, the client generation that
-# matches the Redis 7 server this broker URL points at.
-celery[redis]==5.3.6      # app/tasks/celery_tasks.py line 1
+celery==5.3.4             # app/tasks/celery_tasks.py line 1
+# celery 5.3.4 bounds the broker client at redis<5.0.0 under extra == 'redis'
+# alone, and core celery - the form declared here - does not request that extra,
+# so the pair resolves and pip check stays clean. 5.0.1 is the client generation
+# that matches the Redis 7 server CELERY_BROKER_URL points at.
 redis==5.0.1              # broker for CELERY_BROKER_URL at celery_tasks.py line 9
 
 # Security
 # The cryptography extra is load-bearing, not decorative: it is what makes jose
 # select its cryptography RSA and EC backends and leave the bundled ecdsa one idle.
 python-jose[cryptography]==3.3.0   # JWT at security.py line 2
-# The bcrypt extra names passlib's hashing backend but does not bound its
-# version, so the one release that actually works is pinned in the provider
-# block at the end of this file rather than left to the resolver.
+# The bcrypt extra names the backend CryptContext selects, without bounding it.
+# passlib 1.7.4 is that project's final release: it reads bcrypt.__about__, which
+# bcrypt 4.1 removed, and probes a 255-byte secret, which bcrypt 5.0 rejects, so
+# an environment that exercises security.py line 15 needs bcrypt 4.0.x. That
+# provider is indirect, so the constraint is recorded rather than declared.
 passlib[bcrypt]==1.7.4             # CryptContext at security.py line 8
 
 # Utilities
@@ -68,42 +65,3 @@ python-dotenv==1.0.0      # backs env_file = ".env" at app/core/config.py line 1
 # Test tooling
 pytest==7.4.4             # invoked by ci.yml line 37
 httpx==0.25.2             # backs the FastAPI TestClient at tests/test_api.py line 2
-
-# Pinned providers
-# Nothing below is imported by app/. Each record bounds an indirect distribution
-# that one of the seventeen direct records above pulls in but does not constrain
-# tightly enough, and each was measured failing or degrading a clean Python 3.9
-# resolution when left to float. Providers a clean resolution already selects
-# correctly on its own - starlette, protobuf, grpcio, grpcio-status,
-# google-cloud-core, googleapis-common-protos, proto-plus and the rest - are
-# deliberately NOT listed: this is a manifest, not a lock file. protobuf in
-# particular stays unpinned and still lands on 4.25.9 through the bounds the
-# Google records already impose.
-
-# passlib 1.7.4 is that project's final release. It initialises its bcrypt
-# backend by hashing a 255-byte probe secret and by reading bcrypt.__about__ for
-# the provider version. bcrypt 5.0 rejects secrets longer than 72 bytes, so an
-# unbounded passlib[bcrypt] resolves to 5.0.0 and the first CryptContext.hash
-# call at security.py line 15 raises ValueError; bcrypt 4.1 and later removed
-# __about__, which turns that same call into a trapped traceback on stderr.
-# 4.0.1 is the newest release that satisfies both and it ships a cp36-abi3 wheel
-# for 3.9, so hashing neither raises nor logs.
-bcrypt==4.0.1
-
-# The three Google records whose newer releases announce Python 3.9's end of life
-# with a FutureWarning on every client import - noise that reaches
-# app/core/logging.py line 2 and app/services/ocr_service.py line 1, and that is
-# fatal to any caller running under -W error::FutureWarning. Measured
-# boundaries: google-api-core added the check in 2.28.0, google-auth in 2.47.0,
-# google-cloud-appengine-logging in 1.8.0, so the versions below are the newest
-# warning-free ones. google-auth stops at 2.45.0 because 2.46.0 is yanked
-# upstream for a Python 3.8 incompatibility and no 2.46.1 was published. The
-# [grpc] extra is not restated here - the Google clients above already request
-# google-api-core[grpc], so grpcio and grpcio-status still resolve. Re-check the
-# closure after any dependency change, once per client:
-#   python -W error::FutureWarning -c "from google.cloud import storage"
-#   python -W error::FutureWarning -c "from google.cloud import vision"
-#   python -W error::FutureWarning -c "import google.cloud.logging"
-google-api-core==2.27.0
-google-auth==2.45.0
-google-cloud-appengine-logging==1.7.0
