@@ -104,6 +104,51 @@ def _log_safe(value: str) -> str:
     )
 
 
+def _require_setting(name: str, value: str) -> str:
+    # Presence and usefulness are not the same thing, and Settings only
+    # guarantees the first. GOOGLE_CLOUD_PROJECT and
+    # GOOGLE_CLOUD_STORAGE_BUCKET are declared as required str fields
+    # (app/core/config.py lines 9-10), so pydantic refuses a MISSING
+    # variable - but an exported-yet-empty one satisfies that annotation and
+    # travels on into the client library, where it fails in two unhelpful
+    # ways: an empty project is retained verbatim by storage.Client and
+    # resurfaces much later as an unattributable API fault, while an empty
+    # bucket name raises IndexError from inside the library the moment a
+    # blob reference is built. An empty bucket name would also neuter the
+    # bucket-identity check in _bucket_relative_path, because every
+    # candidate bucket would then only have to match the empty string to be
+    # accepted as ours.
+    #
+    # So both values are settled here, before any client, bucket or origin
+    # decision can rest on them, and the message names the exact variable an
+    # operator has to set instead of leaving a library-internal exception to
+    # be decoded. No default is substituted and no second configuration path
+    # is opened: get_settings() remains the only source.
+    stripped = (value or "").strip()
+    if not stripped:
+        raise ValueError(
+            "{0} is empty; the runtime environment must set it".format(name))
+    return stripped
+
+
+def _get_project_id() -> str:
+    # Read per call rather than held, because get_settings() is not memoised
+    # (app/core/config.py lines 18-19); what gets cached is the client this
+    # value builds, in _get_client.
+    return _require_setting(
+        "GOOGLE_CLOUD_PROJECT", get_settings().GOOGLE_CLOUD_PROJECT)
+
+
+def _get_bucket_name() -> str:
+    # One validated source for the bucket name, used BOTH to address the
+    # bucket and to decide whether an inbound identifier names our bucket.
+    # Those two uses must never disagree, which is why neither of them reads
+    # the setting directly.
+    return _require_setting(
+        "GOOGLE_CLOUD_STORAGE_BUCKET",
+        get_settings().GOOGLE_CLOUD_STORAGE_BUCKET)
+
+
 def _get_client() -> storage.Client:
     # Construction is lazy and cached so that IMPORTING this module never
     # requires credentials and never touches the network. That matters
@@ -112,10 +157,42 @@ def _get_client() -> storage.Client:
     # access at app/db/database.py line 5. get_settings() is not memoised
     # (app/core/config.py lines 18-19), so the client handle - not the
     # settings object - is what has to be held here.
+    #
+    # TWO RUNTIME PREREQUISITES THIS MODULE CANNOT PROVISION FOR ITSELF,
+    # both owned by the Cloud Run service at infrastructure/terraform/
+    # main.tf lines 79-95, whose container spec declares nothing but an
+    # image:
+    #
+    # 1. CONFIGURATION. That revision receives none of the seven no-default
+    #    Settings fields - PROJECT_NAME, API_V1_STR, SECRET_KEY,
+    #    DATABASE_URL, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_STORAGE_BUCKET,
+    #    EMAIL_SUBMISSION_ADDRESS (app/core/config.py lines 5-11) - and no
+    #    .env file is committed, so the first storage call fails inside
+    #    get_settings() with a pydantic ValidationError naming every absent
+    #    field, before any object is addressed. Making that revision usable
+    #    means setting those values on it, GOOGLE_CLOUD_PROJECT from
+    #    var.project_id and GOOGLE_CLOUD_STORAGE_BUCKET from
+    #    "${var.project_id}-mca-documents", so that it addresses
+    #    google_storage_bucket.mca_documents (main.tf lines 43-46) and not
+    #    the unrelated processed bucket at lines 48-51.
+    #
+    # 2. IDENTITY. That revision also declares no service_account_name, so
+    #    it runs as the Compute Engine default service account. Every grant
+    #    at main.tf lines 116-145 - roles/editor, roles/storage.admin,
+    #    roles/cloudsql.admin, roles/pubsub.admin - is bound to
+    #    mca-service-account, a DIFFERENT principal, so object access
+    #    currently rests on whatever the default account happens to carry
+    #    rather than on the storage role the Terraform provisions. Attaching
+    #    google_service_account.mca_service_account to the revision is what
+    #    puts the granted role in force; _get_signing_kwargs records what
+    #    the same gap costs a signed URL.
+    #
+    # Both are deployment facts rather than code defects, recorded at the
+    # point of use because infrastructure/terraform/ is not modified from
+    # here and neither one can be repaired in Python.
     global _client
     if _client is None:
-        settings = get_settings()
-        _client = storage.Client(project=settings.GOOGLE_CLOUD_PROJECT)
+        _client = storage.Client(project=_get_project_id())
     return _client
 
 
@@ -124,8 +201,7 @@ def _get_bucket() -> storage.Bucket:
     # every public call below costs exactly one storage round trip instead of
     # two. The bucket is provisioned by Terraform, not by this service, so
     # proving it exists on each request would buy nothing.
-    settings = get_settings()
-    return _get_client().bucket(settings.GOOGLE_CLOUD_STORAGE_BUCKET)
+    return _get_client().bucket(_get_bucket_name())
 
 
 def _build_object_name(filename: str) -> str:
@@ -186,10 +262,14 @@ def _bucket_relative_path(parsed: ParseResult, candidate: str) -> str:
     # for now so that an encoded separator cannot masquerade as a real one
     # while the bucket segment is removed; _resolve_object_name decodes it
     # once that segment is gone.
+    #
+    # The name compared against arrives through _get_bucket_name rather than
+    # from the setting directly, so a blank configuration value cannot reduce
+    # the comparison below to a formality that every candidate satisfies.
     scheme = parsed.scheme.lower()
     host = parsed.netloc.lower()
     path = parsed.path.lstrip("/")
-    bucket_name = get_settings().GOOGLE_CLOUD_STORAGE_BUCKET
+    bucket_name = _get_bucket_name()
     if scheme == "gs":
         if host != bucket_name.lower():
             raise ValueError(
@@ -292,17 +372,26 @@ def _get_signing_kwargs() -> Dict[str, object]:
     # impersonated identity, is passed through untouched instead, so a
     # deployment that grows a signing key needs no change here.
     #
-    # STILL AN UNMET INFRASTRUCTURE PREREQUISITE: signBlob requires the IAM
-    # Service Account Credentials API to be enabled and the role
-    # roles/iam.serviceAccountTokenCreator to be granted to
-    # mca-service-account. main.tf lines 116-146 grant roles/editor,
-    # roles/storage.admin, roles/cloudsql.admin and roles/pubsub.admin only,
-    # so until the Terraform grants that role this path fails at the signBlob
-    # call with a logged TransportError - loudly, at read time, with a
-    # message that names the cause. That gap is exactly why the upload path
-    # returns the canonical object URL, which needs nothing beyond the
-    # storage role already granted, and why that canonical URL is what lands
-    # in the non-nullable storage_url column.
+    # STILL UNMET INFRASTRUCTURE PREREQUISITES, and there are three of them
+    # rather than one. signBlob needs the IAM Service Account Credentials API
+    # enabled AND roles/iam.serviceAccountTokenCreator held by the identity
+    # the revision actually runs as - and that identity is not the one the
+    # Terraform provisions. main.tf lines 79-95 attach no
+    # service_account_name to the Cloud Run service, so the revision runs as
+    # the Compute Engine default service account, while lines 116-145 grant
+    # roles/editor, roles/storage.admin, roles/cloudsql.admin and
+    # roles/pubsub.admin to mca-service-account instead. Signing therefore
+    # becomes possible only once the revision is given that account (or the
+    # token-creator role is granted to the identity it does run as), the
+    # credentials API is enabled, and that token-creator grant exists. Until
+    # all three hold, this path fails at the signBlob call with a logged
+    # error - loudly, at read time, with a message that names the cause.
+    #
+    # The same identity gap is why the upload path returns the canonical
+    # object URL and why that URL is what lands in the non-nullable
+    # storage_url column: a canonical URL needs no signing credential at all,
+    # only ordinary object permissions on whichever identity is in force, so
+    # it is the form least able to break on this deployment.
     global _signing_credentials
     if _signing_credentials is None:
         try:
