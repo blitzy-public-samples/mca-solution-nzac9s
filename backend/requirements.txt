@@ -1,20 +1,15 @@
-# Python dependency manifest for the MCA backend, already referenced by ci.yml
-# line 29, infrastructure/docker/Dockerfile.backend lines 8 and 11, and
-# scripts/setup_environment.sh line 13, so creating it repairs all three
-# consumers and none of them is edited. Target runtime: Python 3.9, declared at
-# ci.yml line 19 and Dockerfile.backend line 2, so every pin below has to resolve
-# inside that envelope. Each pin uses == because this repository carries no lock
-# file and three of them encode hard compatibility constraints that a range would
-# let a future resolver violate. The seven groups below are the 17 direct
-# dependencies of app/ and nothing else: starlette, protobuf, bcrypt,
-# google-api-core and every other indirect distribution stays a resolver result
-# rather than a declaration, and flake8 is deliberately absent because ci.yml
-# line 46 installs it separately for the lint step.
+# Backend dependency manifest for Python 3.9, the runtime ci.yml line 19
+# and Dockerfile.backend line 2 declare, so every pin resolves inside that
+# envelope. Versions are exact because no lock file constrains them, and
+# some pins encode hard compatibility constraints a range would let a
+# resolver violate. Only direct dependencies are declared, across runtime,
+# deployment and test concerns; transitive ones are resolver results.
 
 # Web framework
-# pydantic MUST stay below 2.0: app/core/config.py line 1 imports BaseSettings from
-# pydantic, which 2.0 moved out to the separate pydantic-settings package. This pin
-# is what keeps config.py working unedited; fastapi is held below 0.100 to match.
+# pydantic MUST stay below 2.0: app/core/config.py line 1 imports
+# BaseSettings from pydantic, which 2.0 moved out to the separate
+# pydantic-settings package. This pin is what keeps config.py working
+# unedited; fastapi is held below 0.100 to match.
 fastapi==0.99.1
 pydantic==1.10.13
 # python-multipart is mandatory, not optional: app/api/attachments.py line 10
@@ -23,45 +18,36 @@ python-multipart==0.0.6
 uvicorn==0.23.2           # ASGI server named in Dockerfile.backend line 20
 
 # Persistence
-# SQLAlchemy MUST be 2.x: app/db/models.py line 1 imports UUID from the sqlalchemy
-# root namespace, which earlier majors do not expose.
+# SQLAlchemy MUST be 2.x: app/db/models.py line 1 imports UUID from the
+# sqlalchemy root namespace, which earlier majors do not expose.
 SQLAlchemy==2.0.23
-psycopg2-binary==2.9.9    # driver for the postgresql:// DSN at app/db/database.py:5
+# PostgreSQL driver for DATABASE_URL consumed at app/db/database.py:5
+psycopg2-binary==2.9.9
 
 # Google Cloud
-google-cloud-storage==2.14.0   # the one new distribution; backs storage_service.py
-# google-cloud-vision must be 2.0 or later, where the types and enums submodules
-# were removed: ocr_service.py uses vision.Image, not vision.types.Image.
+# the one new distribution; backs storage_service.py
+google-cloud-storage==2.14.0
+# google-cloud-vision stays on a modern release so the planned OCR update
+# can use vision.Image, after vision.types was removed in v2.0.
 google-cloud-vision==3.5.0
 google-cloud-logging==3.9.0    # app/core/logging.py line 2 imports its Client
-# google-api-core, google-auth and google-cloud-appengine-logging arrive through
-# the three clients above. Releases of them published after Python 3.9 reached
-# end of life add an informational FutureWarning to these imports, which is why
-# the closure is left to the resolver instead of bounded here.
 
 # Task queue
-celery==5.3.4             # app/tasks/celery_tasks.py line 1
-# celery 5.3.4 bounds the broker client at redis<5.0.0 under extra == 'redis'
-# alone, and core celery - the form declared here - does not request that extra,
-# so the pair resolves and pip check stays clean. 5.0.1 is the client generation
-# that matches the Redis 7 server CELERY_BROKER_URL points at.
-redis==5.0.1              # broker for CELERY_BROKER_URL at celery_tasks.py line 9
+celery==5.3.4      # app/tasks/celery_tasks.py line 1
+redis==5.0.1       # broker for CELERY_BROKER_URL at celery_tasks.py line 9
 
 # Security
-# The cryptography extra is load-bearing, not decorative: it is what makes jose
-# select its cryptography RSA and EC backends and leave the bundled ecdsa one idle.
+# The cryptography extra is load-bearing, not decorative: it is what
+# makes jose select its cryptography RSA and EC backends and leave the
+# bundled ecdsa one idle.
 python-jose[cryptography]==3.3.0   # JWT at security.py line 2
 # The bcrypt extra names the backend CryptContext selects, without bounding it.
-# passlib 1.7.4 is that project's final release: it reads bcrypt.__about__, which
-# bcrypt 4.1 removed, and probes a 255-byte secret, which bcrypt 5.0 rejects, so
-# an environment that exercises security.py line 15 needs bcrypt 4.0.x. That
-# provider is indirect, so the constraint is recorded rather than declared.
 passlib[bcrypt]==1.7.4             # CryptContext at security.py line 8
 
 # Utilities
-requests==2.31.0          # app/services/webhook_service.py line 1
-python-dotenv==1.0.0      # backs env_file = ".env" at app/core/config.py line 15
+requests==2.31.0       # app/services/webhook_service.py line 1
+python-dotenv==1.0.0   # backs env_file = ".env" at app/core/config.py line 15
 
 # Test tooling
-pytest==7.4.4             # invoked by ci.yml line 37
-httpx==0.25.2             # backs the FastAPI TestClient at tests/test_api.py line 2
+pytest==7.4.4      # invoked by ci.yml line 37
+httpx==0.25.2      # backs the FastAPI TestClient at tests/test_api.py line 2
