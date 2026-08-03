@@ -4,53 +4,17 @@
 # some pins encode hard compatibility constraints a range would let a
 # resolver violate. Only direct dependencies are declared, across runtime,
 # deployment and test concerns; transitive ones are resolver results.
-#
-# Two rules decide every version below, and where they disagree the first
-# one wins. Take the newest release that carries the published security
-# fixes; never take one that breaks a source file this change may not edit.
-# Where the first rule cannot be satisfied on Python 3.9 the shortfall is
-# named in a comment beside the pin rather than left to be discovered.
 
 # Web framework
 # pydantic MUST stay below 2.0: app/core/config.py line 1 imports
 # BaseSettings from pydantic, which 2.0 moved out to the separate
 # pydantic-settings package. This pin is what keeps config.py working
-# unedited, and it is the constraint the fastapi pin below answers to.
+# unedited; fastapi is held below 0.100 to match.
+fastapi==0.99.1
 pydantic==1.10.13
-# fastapi 0.125.0 is the LAST release that still accepts pydantic 1.x: it
-# declares pydantic>=1.7.4,<3.0.0, while 0.126.0 raised that floor to
-# pydantic>=2.7.0. So this is the newest version reachable without editing
-# config.py, and it is what allows the starlette pin below.
-fastapi==0.125.0
-# starlette is pinned EXPLICITLY, not left to fastapi's starlette>=0.40.0,
-# <0.51.0 range, because there is no lock file: a future resolver could
-# legally pick 0.40.0 and reintroduce fixes already made. 0.49.3 is the
-# highest release inside that range that still supports Python 3.9, and it
-# carries all three multipart and response fixes that matter here -
-# unbounded multipart field memory (CVE-2024-47874, fixed in 0.40.0),
-# large-file upload blocking the event loop (CVE-2025-54121, fixed in
-# 0.47.2) and quadratic Range handling in FileResponse (CVE-2025-62727,
-# fixed in 0.49.1). The first of those is observable: this release splits
-# the old single 1 MiB knob into spool_max_size, still only the point at
-# which a FILE part moves to disk, and max_part_size, a real cap that
-# refuses an oversized NON-FILE form field with a 400 instead of
-# accumulating it. Under 0.27.0 no such cap existed.
-# RESIDUAL: the later Host-header validation fix
-# (CVE-2026-48710) first ships in starlette 1.0.1, which fastapi's
-# pydantic-1.x line cannot reach; this application enforces no
-# URL-derived security decision, so that defect has no reachable path here.
-starlette==0.49.3
 # python-multipart is mandatory, not optional: app/api/attachments.py line 10
 # declares UploadFile = File(...), and uploads reach FastAPI as form data.
-# 0.0.20 is the highest release that still supports Python 3.9 and it fixes
-# both the Content-Type ReDoS (CVE-2024-24762, fixed in 0.0.7) and the
-# malformed-boundary denial of service (CVE-2024-53981, fixed in 0.0.18).
-# RESIDUAL: later parser hardening requires Python 3.10 or above, so it is
-# unreachable until the runtime moves. app/services/storage_service.py
-# compensates for what this parser cannot bound, refusing any document over
-# MAX_DOCUMENT_BYTES and any content type that is not a plain media type;
-# a request-body limit at the proxy remains a deployment-side control.
-python-multipart==0.0.20
+python-multipart==0.0.6
 uvicorn==0.23.2           # ASGI server named in Dockerfile.backend line 20
 
 # Persistence
@@ -75,41 +39,15 @@ redis==5.0.1       # broker for CELERY_BROKER_URL at celery_tasks.py line 9
 # Security
 # The cryptography extra is load-bearing, not decorative: it is what
 # makes jose select its cryptography RSA and EC backends and leave the
-# bundled ecdsa one idle. 3.5.0 is required rather than preferred - 3.3.0
-# is affected by the OpenSSH ECDSA algorithm confusion that can allow a
-# forged token to verify (CVE-2024-33663) and by two JWE decompression
-# resource-exhaustion defects (CVE-2024-33664, CVE-2024-29370), and the
-# fixes begin at 3.4.0. app/core/security.py line 25 signs with a single
-# named algorithm and app/core/config.py declares no algorithm allowlist
-# field, so nothing here has to change for the upgrade.
-python-jose[cryptography]==3.5.0
-# The bcrypt extra names the backend CryptContext selects, without bounding
-# it, so it must be bounded here. passlib 1.7.4 probes its bcrypt backend
-# with a 255-byte secret, and bcrypt 5.x rejects any password over 72
-# bytes: a clean install that resolved bcrypt 5 would raise ValueError on
-# the first password hashed at app/core/security.py line 8, not at install
-# time. pip check does not see this, because bcrypt>=3.1.0 is satisfied.
-# 4.0.1 is the newest release that still answers that probe.
-passlib[bcrypt]==1.7.4
-# The authorised provider for the extra above, NOT a distribution this
-# codebase imports directly. It is declared here because that extra's own
-# bcrypt>=3.1.0 constraint is too loose to be safe.
-bcrypt==4.0.1
+# bundled ecdsa one idle.
+python-jose[cryptography]==3.3.0   # JWT at security.py line 2
+# The bcrypt extra names the backend CryptContext selects, without bounding it.
+passlib[bcrypt]==1.7.4             # CryptContext at security.py line 8
 
 # Utilities
-# requests 2.32.5 is the newest release supporting Python 3.9, and 2.31.0
-# predates two fixes it carries: the .netrc credential leak on maliciously
-# crafted URLs (CVE-2024-47081) and the session certificate-verification
-# cache defect (CVE-2024-35195). app/services/webhook_service.py line 1
-# posts to URLs read from the database, which is exactly the input class the
-# first of those turns on, and it relies on the library's default TLS
-# verification, which stays on.
-requests==2.32.5
+requests==2.31.0       # app/services/webhook_service.py line 1
 python-dotenv==1.0.0   # backs env_file = ".env" at app/core/config.py line 15
 
 # Test tooling
 pytest==7.4.4      # invoked by ci.yml line 37
-# httpx 0.28.1 rather than 0.25.2: starlette 0.49.3 declares
-# httpx>=0.27.0,<0.29.0 for the TestClient that tests/test_api.py line 2
-# imports, so the older pin no longer satisfies the client it backs.
-httpx==0.28.1
+httpx==0.25.2      # backs the FastAPI TestClient at tests/test_api.py line 2

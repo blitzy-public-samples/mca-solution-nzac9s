@@ -446,20 +446,23 @@ def _payload_too_large(
     operation: str,
     object_name: str,
     bucket_name: str,
-    size: Optional[int],
+    observed: int,
 ) -> StoragePayloadTooLargeError:
-    # Refuses a stored object that would not fit the ceiling, before a single
-    # byte of it is read. A size is not sensitive, so it is reported in both
+    # Refuses a stored object that does not fit the ceiling. The read that
+    # discovers it is bounded at the ceiling plus one byte, so `observed` is a
+    # LOWER BOUND on the object's size rather than the size itself - which is
+    # all that has to be true for the refusal to be correct, and all that ever
+    # reaches memory. It is reported as such, ">=", so nobody reads the figure
+    # as a measurement. A byte count is not sensitive, so it appears in both
     # the record and the message; the object is still named by reference only.
-    reported = "unknown" if size is None else "{0:d}".format(size)
     reference = _object_ref(object_name)
     logger.error(
         f"{operation} refused: object={reference} "
-        f"bucket={_log_safe(bucket_name)} size={reported} "
+        f"bucket={_log_safe(bucket_name)} bytes>={observed:d} "
         f"limit={MAX_DOCUMENT_BYTES}")
     return StoragePayloadTooLargeError(
-        "{0} refused: object={1} size={2} limit={3}".format(
-            operation, reference, reported, MAX_DOCUMENT_BYTES))
+        "{0} refused: object={1} bytes>={2:d} limit={3}".format(
+            operation, reference, observed, MAX_DOCUMENT_BYTES))
 
 
 def _validate_content_type(content_type: Optional[str]) -> str:
@@ -647,14 +650,14 @@ def _get_client() -> storage.Client:
 
 def _get_bucket(bucket_name: str) -> storage.Bucket:
     # bucket() builds a local reference and performs no existence check, so
-    # an upload costs exactly one storage round trip instead of two. The
-    # bucket is provisioned by Terraform, not by this service, so proving it
-    # exists on each request would buy nothing.
+    # every public operation in this module costs exactly ONE storage round
+    # trip rather than two. The bucket is provisioned by Terraform, not by
+    # this service, so proving it exists on each request would buy nothing.
     #
-    # A read costs two, and deliberately: get_file_content asks for the
-    # object's metadata before it asks for the object, because a size it has
-    # not seen is a size it cannot refuse. That extra round trip buys the
-    # ceiling, and it is the only place in this module that pays it.
+    # blob() is local in the same way, which is what keeps the read path to a
+    # single operation as well: get_file_content bounds the transfer with a
+    # byte range on the download itself instead of asking for the object's
+    # metadata first.
     #
     # The name is taken as an argument rather than read here, because the
     # caller has already validated it once through _get_bucket_name and a
@@ -996,16 +999,32 @@ def upload_attachment(
     # _get_bucket_name, so a refused upload costs no key generation, no
     # pydantic validation pass over the environment and no .env read.
     #
-    # The type check is load-bearing rather than decorative. upload_from_string
-    # accepts str as well as bytes and would encode it, but len() on a str
-    # counts CHARACTERS - so a string payload could carry up to three times
-    # the byte ceiling past a check that looked correct. Refusing anything but
-    # a byte payload is what makes the next check mean what it says. Both
-    # legitimate callers already pass bytes: email_processor.py line 45 uses
-    # part.get_payload(decode=True), and upload_file awaits UploadFile.read.
+    # The type check is load-bearing rather than decorative, and it admits
+    # bytes ALONE - not str, and not bytearray either.
+    #
+    # str is refused because upload_from_string would happily encode it while
+    # len() on a str counts CHARACTERS, so a string payload could carry up to
+    # three times the byte ceiling past a check that looked correct. Refusing
+    # it is what makes the next check mean what it says.
+    #
+    # bytearray is refused because the pinned client cannot store one. Its
+    # upload path converts the payload through google.cloud._helpers._to_bytes,
+    # which accepts str or bytes and raises TypeError for anything else -
+    # "bytearray(b'...') could not be converted to bytes". That TypeError is
+    # NOT a GoogleAPIError, so the handler below would not see it: a mutable
+    # buffer would sail through argument validation and then fail in
+    # production, while a permissive test double that never performs the same
+    # conversion would report the upload as a success. Refusing it here, with
+    # the ValueError this module raises for every other unusable argument and
+    # before any network call, is the only reading under which the message
+    # above and the behaviour agree.
+    #
+    # Both legitimate callers already pass bytes: email_processor.py line 45
+    # uses part.get_payload(decode=True), and upload_file awaits
+    # UploadFile.read.
     if file_content is None:
         raise ValueError("file_content is required to upload an attachment")
-    if not isinstance(file_content, (bytes, bytearray)):
+    if not isinstance(file_content, bytes):
         raise ValueError("file_content must be bytes")
     if len(file_content) > MAX_DOCUMENT_BYTES:
         raise ValueError(
@@ -1096,48 +1115,46 @@ def get_file_content(file_path: str) -> bytes:
     # StorageObjectNotFoundError, which still IS a NotFound, so a caller that
     # reads a miss by catching that family keeps reading it correctly.
     #
-    # THE OBJECT IS MEASURED BEFORE IT IS READ. download_as_bytes returns
-    # whatever the object holds, and the object arrives from a bucket rather
-    # than from an argument, so its size is not something this process chose:
-    # a caller resolving an identifier out of the storage_url column has no
-    # idea how large the object behind it is, and a Celery worker that
-    # materialises it whole pays for that in resident memory (CWE-400). One
-    # metadata read answers the question first, and an object over the ceiling
-    # is refused without a byte of it being transferred.
+    # ONE STORAGE OPERATION, AND IT IS BOUNDED. The object arrives from a
+    # bucket rather than from an argument, so its size is not something this
+    # process chose: a caller resolving an identifier out of the storage_url
+    # column has no idea how large the object behind it is, and a Celery worker
+    # that materialises it whole pays for that in resident memory (CWE-400).
     #
-    # The download is then PINNED to the generation the metadata described.
-    # Without that, the two calls are a time-of-check-to-time-of-use pair: an
-    # object replaced between them would be measured small and delivered
-    # large. if_generation_match turns that race into a precondition failure
-    # instead of an oversized body, and it is used in preference to a ranged
-    # read for a second reason - Cloud Storage omits its checksum header on a
-    # ranged response, and the client library responds by silently swapping in
-    # a do-nothing hash, so bounding the read that way would quietly buy the
-    # ceiling at the cost of end-to-end integrity verification.
+    # The ceiling is therefore applied to the transfer itself, by asking for a
+    # byte RANGE of the limit plus one. `end` is inclusive, so a conforming
+    # object arrives whole while an over-large one arrives as exactly one byte
+    # more than the ceiling - the object announcing that it is too large -
+    # and nothing beyond that ever reaches memory. That keeps the read to the
+    # single round trip every public function here is allowed: a preliminary
+    # metadata read would answer the same question at the cost of a second
+    # operation AND a time-of-check-to-time-of-use window, since an object
+    # replaced between the two calls would be measured small and delivered
+    # large.
+    #
+    # THE RESIDUAL IS RECORDED RATHER THAN HIDDEN. Cloud Storage omits its
+    # checksum header on a ranged response, and the client library answers that
+    # by substituting a do-nothing hash, so this transfer is not verified
+    # end-to-end by the library. TLS still protects the bytes in flight; what
+    # is given up is a corruption check, and it is given up deliberately,
+    # because an unbounded read into a 512 MiB container is the larger risk.
     candidate = _validate_identifier(file_path)
     bucket_name = _get_bucket_name()
     object_name = _resolve_object_name(candidate, bucket_name)
     bucket = _get_bucket(bucket_name)
     blob = bucket.blob(object_name)
     try:
-        blob.reload()
-    except google_exceptions.GoogleAPIError as e:
-        raise _storage_failure(
-            "Metadata read", object_name, bucket_name, e) from None
-    size = blob.size
-    if size is None or size > MAX_DOCUMENT_BYTES:
-        # Raised OUTSIDE the try blocks on purpose: StoragePayloadTooLargeError
-        # is a GoogleAPIError, so raising it inside one would be caught by that
-        # handler and re-reported as an ordinary storage fault. An unknown size
-        # is refused with it, because a ceiling that cannot be evaluated has
-        # not been enforced.
-        raise _payload_too_large(
-            "Download", object_name, bucket_name, size)
-    try:
-        return blob.download_as_bytes(if_generation_match=blob.generation)
+        file_content = blob.download_as_bytes(end=MAX_DOCUMENT_BYTES)
     except google_exceptions.GoogleAPIError as e:
         raise _storage_failure(
             "Download", object_name, bucket_name, e) from None
+    if len(file_content) > MAX_DOCUMENT_BYTES:
+        # Raised OUTSIDE the try block on purpose: StoragePayloadTooLargeError
+        # is a GoogleAPIError, so raising it inside one would be caught by that
+        # handler and re-reported as an ordinary storage fault.
+        raise _payload_too_large(
+            "Download", object_name, bucket_name, len(file_content))
+    return file_content
 
 
 def delete_file(file_path: str) -> None:
