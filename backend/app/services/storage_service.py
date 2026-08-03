@@ -5,7 +5,7 @@
 #
 #     app/api/attachments.py line 5        upload_file
 #     app/services/email_processor.py:6    upload_attachment
-#     app/services/ocr_service.py line 4   get_file_content
+#     app/services/ocr_service.py line 3   get_file_content
 #
 # While no file sat at this import path every one of those statements raised
 # ModuleNotFoundError: No module named 'app.services.storage_service' at
@@ -19,15 +19,18 @@
 # bucket as google_storage_bucket.mca_documents. The AWS S3 named in
 # README.md is stale scaffold text with no counterpart in code or Terraform.
 
+import hashlib
 import logging
 import re
+import unicodedata
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import ParseResult, unquote, urlparse
 
 from fastapi import UploadFile
 from google.api_core import exceptions as google_exceptions
+from google.api_core import retry as google_retry
 from google.cloud import storage
 
 from app.core.config import get_settings
@@ -35,6 +38,13 @@ from app.core.config import get_settings
 logger = logging.getLogger(__name__)
 
 ATTACHMENT_PREFIX = "attachments"
+
+# Every key this module writes begins with this, and the read helpers accept
+# nothing outside it - see _validated_object_name. The bucket is provisioned
+# for the whole application rather than for this module alone, so the prefix
+# is what separates "a document this service stored" from "anything else that
+# happens to live in the same bucket".
+OBJECT_NAME_NAMESPACE = ATTACHMENT_PREFIX + "/"
 
 # Applied when a caller supplies no MIME type, and when the one supplied
 # cannot be trusted as metadata (see _resolve_content_type), so the stored
@@ -84,12 +94,23 @@ MAX_OBJECT_NAME_BYTES = 1024
 # module straight out of a multipart header or an e-mail part, which is
 # exactly where such a character enters. That band is taken whole rather than
 # with #x85 punched out of the middle of it, and the remaining C0 controls
-# and the U+2028/U+2029 line separators are folded in as well, because those
-# are the same code points that let caller text forge a second record inside
-# a log line - so ONE set serves both the provider requirement and the
-# log-safety one, and neither can be satisfied while forgetting the other.
+# and the U+2028/U+2029 line separators are folded in as well.
+#
+# The bidirectional formatting characters - the marks, embeddings, overrides
+# and isolates - join them for a different reason: they change how a name
+# RENDERS without changing what it addresses, so a key ending "fdp.exe" can
+# be made to read as "exe.pdf" in any console, listing or ticket a person
+# later inspects. Nothing this service stores has a use for them.
+#
+# ONE set then serves two jobs, in opposite directions. On the way in,
+# _build_object_name substitutes every one of these code points, so the
+# provider's requirement is met and no emitted key can carry one. On the way
+# back, _validated_object_name REFUSES any identifier that contains one, so a
+# name this service could not have minted cannot be addressed through it.
 UNSAFE_CODE_POINTS = frozenset(
-    list(range(0x00, 0x20)) + list(range(0x7F, 0xA0)) + [0x2028, 0x2029])
+    list(range(0x00, 0x20)) + list(range(0x7F, 0xA0))
+    + [0x2028, 0x2029, 0x200E, 0x200F]
+    + list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A)))
 
 # Substituting rather than deleting keeps the substitution visible in the
 # stored key, and "_" is already what this module puts in place of a path
@@ -119,30 +140,72 @@ UPLOAD_CHUNK_BYTES = 1024 * 1024
 # <bucket>.storage.googleapis.com, which carries the bucket in the hostname
 # and so keeps its whole path as the object name.
 PATH_STYLE_HOSTS = ("storage.googleapis.com", "storage.cloud.google.com")
+VIRTUAL_HOSTED_SUFFIX = ".storage.googleapis.com"
+
+# The only two schemes an identifier emitted by this service can carry: gs://
+# for the storage URI form, and https:// for the canonical object URL that
+# blob.public_url produces and Attachment.storage_url keeps. Every other
+# scheme - http, file, data, or anything a caller invents - is refused rather
+# than reduced to its tail, because a value in one of them did not come from
+# here and naming an object in this bucket is not what it was doing.
+ALLOWED_URI_SCHEMES = frozenset(["gs", "https"])
+
+# Ceiling on the raw identifier, applied before it is parsed. Every form this
+# service emits is bounded by construction - a scheme, a host, a bucket and a
+# percent-encoded name of at most MAX_OBJECT_NAME_BYTES, which even tripled by
+# escaping stays well inside this - so a value beyond it is not an identifier
+# that went out of here, and no parsing, decoding or normalising is spent on
+# it.
+MAX_IDENTIFIER_CHARS = 4096
+
+# A V4 signature cannot outlive seven days; the provider rejects anything
+# longer. generate_download_url applies the bound itself so an out-of-policy
+# request costs no settings read and no provider call.
+MAX_SIGNED_URL_MINUTES = 7 * 24 * 60
 
 _client = None
 
 
-def _loggable(value: str) -> str:
-    # Every name this module logs is at least partly CALLER TEXT: the tail of
-    # a generated key is a client filename, and the identifier handed to each
-    # read helper is whatever the caller passed. Writing that verbatim into a
-    # log record would let a crafted value end the line and forge a second
-    # one, so exactly the code points a log consumer could read as a record
-    # boundary are escaped. Everything printable survives, non-ASCII
-    # included, because merchant filenames legitimately carry it and a record
-    # nobody can read is no better than one that lies.
+def _object_id(object_name: str) -> str:
+    # NO OBJECT NAME IS EVER LOGGED, only this digest of one, and the reason
+    # is what those names contain. The tail of a generated key is a client
+    # filename, and the identifier handed to a read helper is whatever the
+    # caller passed: between them they carry merchant names, account and
+    # policy numbers and anything else a person chose to put in a filename,
+    # and - when the value is a signed URL - the X-Goog-Credential and
+    # X-Goog-Signature parameters that ARE the authorisation to fetch the
+    # object. A log record is read, copied, shipped to an aggregator and kept
+    # far longer than any of that should live.
     #
-    # The rendering is bounded as well. A generated key cannot exceed
-    # MAX_OBJECT_NAME_BYTES, but an identifier arriving from a caller is
-    # under no such limit, and an unbounded one would let a single failed
-    # read write an arbitrarily large record.
-    rendered = "".join(
-        "\\u{0:04x}".format(ord(c)) if ord(c) in UNSAFE_CODE_POINTS else c
-        for c in value[:MAX_OBJECT_NAME_BYTES])
-    if len(value) > MAX_OBJECT_NAME_BYTES:
-        rendered += "...[truncated]"
-    return rendered
+    # What an operator actually needs from a record is whether two of them
+    # concern the SAME object, and a digest answers exactly that question and
+    # no other. It is also structurally incapable of the tricks the raw name
+    # could play: hexadecimal cannot end a log line, cannot reorder how the
+    # record renders, and cannot grow - sixteen characters, whatever arrives.
+    #
+    # sha256 truncated to 64 bits is right for an identifier rather than a
+    # secret: it is stable across records, processes and restarts, it is one
+    # way, and because every generated key carries a uuid4 the input cannot be
+    # reconstructed by guessing filenames either.
+    return hashlib.sha256(object_name.encode("utf-8")).hexdigest()[:16]
+
+
+def _provider_fault(exc: Exception) -> str:
+    # The provider's exception MESSAGE is not safe to log either: api_core
+    # builds it from the response body, which quotes the object name back and,
+    # for a signed request, the query that came with it. The diagnostically
+    # useful part of a failure is not that prose but its classification, and
+    # every piece of that is library-controlled rather than caller-controlled:
+    # the exception class, the HTTP status behind it, and whether api_core's
+    # own predicate considers the fault transient - which is what tells an
+    # operator to retry rather than to investigate. code is normalised through
+    # int() because api_core carries it as an HTTPStatus, whose str() differs
+    # between Python versions.
+    status = getattr(exc, "code", None)
+    if isinstance(status, int):
+        status = int(status)
+    return "{0} status={1} transient={2}".format(
+        type(exc).__name__, status, google_retry.if_transient_error(exc))
 
 
 def _get_client() -> storage.Client:
@@ -158,12 +221,21 @@ def _get_client() -> storage.Client:
     return _client
 
 
+def _bucket_name() -> str:
+    # The configured bucket is wanted in two places - to build a bucket
+    # reference, and to check that a URI identifier names THIS bucket rather
+    # than another - so both go through one accessor and cannot drift apart.
+    # get_settings() is not memoised (app/core/config.py lines 18-19), so this
+    # is a fresh environment read on every call; it performs no I/O.
+    return get_settings().GOOGLE_CLOUD_STORAGE_BUCKET
+
+
 def _get_bucket() -> storage.Bucket:
     # bucket() builds a local reference and performs no existence check, so
     # no extra existence-check request is issued ahead of the operation the
     # caller actually asked for. Terraform provisions the bucket, not this
     # service, so proving it exists on every call would buy nothing.
-    return _get_client().bucket(get_settings().GOOGLE_CLOUD_STORAGE_BUCKET)
+    return _get_client().bucket(_bucket_name())
 
 
 def _build_object_name(filename: str) -> str:
@@ -178,12 +250,22 @@ def _build_object_name(filename: str) -> str:
     # survives verbatim, because the canonical URL percent-encodes it and
     # _resolve_object_name decodes it back, so the round trip is lossless.
     #
-    # Control code points go in the same pass, per UNSAFE_CODE_POINTS: a
-    # Carriage Return or Line Feed would have the provider reject the upload
-    # outright, and the rest of that set either breaks object listing or
-    # travels on into a log record. Substituting after strip() is what keeps
-    # a name that is merely PADDED with CR, LF or tab from carrying those
-    # positions forward as underscores.
+    # Control and bidirectional code points go in the same pass, per
+    # UNSAFE_CODE_POINTS: a Carriage Return or Line Feed would have the
+    # provider reject the upload outright, and the rest of that set either
+    # breaks object listing or makes the stored name render as something it is
+    # not. Substituting after strip() is what keeps a name that is merely
+    # PADDED with CR, LF or tab from carrying those positions forward as
+    # underscores.
+    #
+    # NORMALISATION HAPPENS HERE, at the moment the key is minted, and that
+    # placement is the point. The same filename can arrive in two spellings -
+    # "e" with a combining acute, or the single precomposed character - and
+    # Cloud Storage treats those as two different objects, so a key must be
+    # written in exactly one of them. Composing to NFC last, after the
+    # substitutions, makes that spelling canonical for every key this module
+    # emits, which in turn is what lets _validated_object_name refuse a
+    # decomposed identifier later without ever refusing one of its own.
     #
     # Its LENGTH is untrusted too, and the key leaving here has to be one the
     # provider will accept, so whatever is left of MAX_OBJECT_NAME_BYTES once
@@ -193,7 +275,8 @@ def _build_object_name(filename: str) -> str:
     # while rejecting would cost a merchant a document - or an e-mail poll
     # its whole run - over a filename attribute. The warning keeps it seen.
     safe_name = (filename or "").strip().replace("\\", "/").replace("/", "_")
-    safe_name = safe_name.translate(_CONTROL_TABLE)
+    safe_name = unicodedata.normalize(
+        "NFC", safe_name.translate(_CONTROL_TABLE))
     if not safe_name:
         safe_name = "unnamed"
     day = datetime.utcnow().strftime("%Y/%m/%d")
@@ -211,6 +294,123 @@ def _build_object_name(filename: str) -> str:
     return prefix + safe_name
 
 
+def _percent_decoded(path: str) -> str:
+    # PERCENT-DECODING APPLIES TO URI FORMS ONLY, which is why it lives here
+    # rather than in the caller. A URI path is an ENCODED rendering of the
+    # name, so decoding recovers it. A bare object name is not encoded - it
+    # already IS the key - and a filename may legally contain a literal '%',
+    # which the canonical URL renders as '%25'. Decoding a bare name would
+    # silently rewrite it, turning "abc-report%2Ffinal.pdf" into
+    # "abc-report/final.pdf" and addressing a different object on every read,
+    # delete, probe and signature.
+    #
+    # errors="strict" rather than the default, because the default replaces an
+    # escape that is not valid UTF-8 with U+FFFD and hands back a name nobody
+    # asked for. UnicodeDecodeError is a ValueError, so a caller sees the
+    # documented type either way, but its message quotes the undecodable bytes
+    # of the identifier - so the refusal is raised AFTER the handler has ended
+    # rather than inside it. That placement is the point: an exception raised
+    # inside an except block keeps the original on __context__ even when the
+    # traceback is told to suppress it, and anything that walks that chain -
+    # an error reporter, a structured logger - would find the bytes there.
+    # Raised from outside, this error has no context and no cause at all.
+    decoded = None
+    try:
+        decoded = unquote(path, errors="strict")
+    except UnicodeDecodeError:
+        decoded = None
+    if decoded is None:
+        raise ValueError("file_path is not a valid object identifier")
+    return decoded
+
+
+def _object_name_from_uri(parsed: ParseResult, scheme: str) -> str:
+    # A URI has to be proved to address THIS bucket before its path may be
+    # treated as an object name, and the proof compares the whole authority
+    # rather than the host alone. netloc is used for exactly that reason: it
+    # carries userinfo and a port as well, so "storage.googleapis.com@evil"
+    # and "storage.googleapis.com:8443" both fail a comparison that a
+    # hostname-only check would pass, and so does the look-alike
+    # "storage.googleapis.com.evil.example". Only case is normalised, because
+    # host names are case-insensitive while object names are not.
+    #
+    # Three layouts are recognised and they differ in where the bucket sits: a
+    # gs:// URI carries it as the authority; the two path-style HTTPS hosts
+    # carry it as the FIRST PATH SEGMENT, which is dropped once it has been
+    # checked; the virtual-hosted host carries it as the leading label and so
+    # leaves the whole path as the object name. A URI naming any other bucket
+    # is refused rather than rewritten - retargeting it into the configured
+    # bucket would turn an identifier that names something elsewhere into a
+    # read, a delete or a signature against the one bucket this service can
+    # reach, which is the whole of the confused-deputy problem in one line.
+    bucket = _bucket_name()
+    authority = parsed.netloc.lower()
+    path = parsed.path.lstrip("/")
+    if scheme == "gs":
+        if authority != bucket.lower():
+            raise ValueError("file_path names a different bucket")
+    elif authority in PATH_STYLE_HOSTS:
+        first, _, remainder = path.partition("/")
+        if first != bucket:
+            raise ValueError("file_path names a different bucket")
+        path = remainder
+    elif authority != bucket.lower() + VIRTUAL_HOSTED_SUFFIX:
+        raise ValueError("file_path does not address Cloud Storage")
+    return _percent_decoded(path)
+
+
+def _validated_object_name(object_name: str) -> str:
+    # THE NAMESPACE GATE. Every read, delete, probe and signature in this
+    # module reaches the bucket through here, and what arrives is caller text:
+    # the identifier is persisted in a database column, travels through an API
+    # schema and a Celery task, and comes back with nothing on that path
+    # proving it is still a key this service minted. Non-emptiness is not a
+    # sufficient test, because the bucket is provisioned for the whole
+    # application rather than for these attachments, so a plausible-looking
+    # name would let a caller point this module at an object it was never
+    # meant to touch - and the caller controls the name, while the credentials
+    # are this service's.
+    #
+    # Each refusal below names something a generated key cannot contain, which
+    # is what makes the gate safe to apply to a round trip:
+    #   * a name outside OBJECT_NAME_NAMESPACE - _build_object_name puts every
+    #     key under that prefix and nothing else here writes an object;
+    #   * an empty, "." or ".." segment - the date partition and the uuid4
+    #     leave every segment non-empty, and a dot segment is the ordinary way
+    #     to make one name read as another;
+    #   * a backslash - separators are flattened to "_" before a key is built,
+    #     so a backslash can only have come from outside;
+    #   * a control or bidirectional code point, per UNSAFE_CODE_POINTS, all
+    #     of which are substituted on the way in;
+    #   * a spelling that is not NFC - keys are composed when minted, and an
+    #     alternative spelling addresses a DIFFERENT object at the provider
+    #     while looking identical in a report;
+    #   * more than MAX_OBJECT_NAME_BYTES once UTF-8 encoded - the provider's
+    #     own ceiling, which the key builder already respects.
+    #
+    # THE MESSAGES NAME NO PART OF THE IDENTIFIER, which is a safety property
+    # rather than terseness: a rejected value can be a signed URL whose query
+    # IS authorisation material, and it can carry text that reshapes a log
+    # record once an upstream FastAPI or Celery handler writes the exception
+    # out. The caller already holds what it passed, and no provider operation
+    # has been spent to learn anything more about it.
+    if not object_name:
+        raise ValueError("file_path addresses no object in the bucket")
+    if len(object_name.encode("utf-8")) > MAX_OBJECT_NAME_BYTES:
+        raise ValueError("file_path names an object the provider cannot hold")
+    if "\\" in object_name:
+        raise ValueError("file_path is not a name this service writes")
+    if any(ord(char) in UNSAFE_CODE_POINTS for char in object_name):
+        raise ValueError("file_path is not a name this service writes")
+    if unicodedata.normalize("NFC", object_name) != object_name:
+        raise ValueError("file_path is not a name this service writes")
+    if not object_name.startswith(OBJECT_NAME_NAMESPACE):
+        raise ValueError("file_path is outside the attachments namespace")
+    if any(part in ("", ".", "..") for part in object_name.split("/")):
+        raise ValueError("file_path is not a name this service writes")
+    return object_name
+
+
 def _resolve_object_name(file_path: str) -> str:
     # Callers legitimately hand back whatever this service emitted: the
     # canonical URL is persisted in Attachment.storage_url (app/db/models.py
@@ -222,48 +422,44 @@ def _resolve_object_name(file_path: str) -> str:
     # HTTPS host layouts are accepted for that reason, with any signature
     # query string discarded by urlparse.
     #
-    # PERCENT-DECODING APPLIES TO URI AND URL FORMS ONLY, and that
-    # distinction is the whole point of the branch below. A URL path is an
-    # ENCODED rendering of the name, so decoding recovers it. A bare object
-    # name is not encoded - it already IS the key - and a filename may
-    # legally contain a literal '%', which the canonical URL renders as
-    # '%25'. Decoding a bare name would silently rewrite it, turning
-    # "abc-report%2Ffinal.pdf" into "abc-report/final.pdf" and addressing a
-    # different object on every read, delete, probe and signature.
+    # ACCEPTING THOSE FORMS IS NOT THE SAME AS ACCEPTING ANY STRING. The work
+    # is split into three questions, each answered once: is this identifier
+    # small enough to be worth parsing, does it address this bucket
+    # (_object_name_from_uri), and is what it addresses a name this service
+    # could have written (_validated_object_name). A scheme nobody here emits
+    # is refused outright rather than stripped to its tail, because a value
+    # like "https://evil.example/webhook-handler.zip" is not an object name
+    # with noise around it - it names something else, and reducing it would
+    # quietly turn it into a read against the one bucket this service holds
+    # credentials for.
     #
-    # EMPTINESS IS JUDGED ON THE RESULT, NOT ON THE INPUT, because every
-    # branch below can make nothing out of something. An identifier naming
-    # only a bucket - gs://<bucket>, either HTTPS layout with nothing past
-    # the bucket, or a lone "/" - is not blank, yet it addresses no object
-    # and reduces to "". Carrying that on would build blob(""), spending a
-    # settings read and a request on an object that cannot exist and
+    # A MISSING ARGUMENT IS REFUSED UP FRONT, BUT EMPTINESS IS JUDGED AGAIN ON
+    # THE RESULT, because every branch below can make nothing out of
+    # something. An identifier naming only a bucket - gs://<bucket>, either
+    # HTTPS layout with nothing past the bucket, or a lone "/" - is not blank,
+    # yet it addresses no object and reduces to "". Carrying that on would
+    # build blob(""), spending a request on an object that cannot exist and
     # reporting it as a provider fault far from the caller that supplied it.
-    # The normalised name is therefore checked once, after every branch, and
-    # refused here - the same contract the None and blank inputs carry.
+    # The namespace gate therefore checks the reduced name once more, after
+    # every branch has had its turn at it.
     #
-    # THAT REFUSAL NAMES NO PART OF THE IDENTIFIER, which is a safety
-    # property rather than terseness. A bucket-only form can arrive as a
-    # signed URL, whose query IS authentication material - X-Goog-Credential
-    # and X-Goog-Signature - and whose text may carry control characters
-    # able to forge log records once an upstream FastAPI or Celery handler
-    # writes the exception out. Echoing the value back would hand both to
-    # that log for nothing: the caller already holds what it passed, and no
-    # provider operation has been spent to learn more about it than that.
+    # The length bound comes first because everything after it is work, and
+    # because an identifier of a hundred thousand characters is not one of the
+    # forms above with something extra on the end - it is not an identifier.
     if file_path is None or not file_path.strip():
         raise ValueError("file_path is required to address a stored object")
     candidate = file_path.strip()
+    if len(candidate) > MAX_IDENTIFIER_CHARS:
+        raise ValueError("file_path is too long to be an object identifier")
     parsed = urlparse(candidate)
     scheme = parsed.scheme.lower()
-    if scheme not in ("gs", "http", "https"):
+    if not scheme:
         object_name = candidate.lstrip("/")
+    elif scheme in ALLOWED_URI_SCHEMES:
+        object_name = _object_name_from_uri(parsed, scheme)
     else:
-        path = parsed.path.lstrip("/")
-        if scheme != "gs" and (parsed.hostname or "") in PATH_STYLE_HOSTS:
-            path = path.partition("/")[2]
-        object_name = unquote(path)
-    if not object_name:
-        raise ValueError("file_path addresses no object in the bucket")
-    return object_name
+        raise ValueError("file_path does not address Cloud Storage")
+    return _validated_object_name(object_name)
 
 
 def _resolve_content_type(content_type: Optional[str]) -> str:
@@ -279,17 +475,27 @@ def _resolve_content_type(content_type: Optional[str]) -> str:
     # No allow-list of document types is applied. This application defines no
     # such policy anywhere, and inventing one here would start refusing the
     # legitimate statements and contracts the pipeline exists to read.
+    #
+    # NEITHER WARNING ECHOES A REJECTED DECLARATION, because a content type is
+    # a client header like any other and a malformed one can hold whatever the
+    # sender put there. The two records differ in what they can say for that
+    # reason: the malformed case reports only that a declaration was replaced,
+    # since by definition nothing about it has been validated, while the
+    # active-content case may name the type it matched - that value has just
+    # been proved to be one of the eight constants in ACTIVE_CONTENT_TYPES, so
+    # it is this module's own text rather than the caller's.
     if not content_type:
         return DEFAULT_CONTENT_TYPE
     candidate = content_type.strip()
     if not MEDIA_TYPE_PATTERN.match(candidate):
         logger.warning(
-            f"Malformed content type {_loggable(candidate)} recorded as "
+            f"Malformed content type declaration recorded as "
             f"{DEFAULT_CONTENT_TYPE}")
         return DEFAULT_CONTENT_TYPE
-    if candidate.split(";")[0].strip().lower() in ACTIVE_CONTENT_TYPES:
+    declared = candidate.split(";")[0].strip().lower()
+    if declared in ACTIVE_CONTENT_TYPES:
         logger.warning(
-            f"Active content type {_loggable(candidate)} recorded as "
+            f"Active content type {declared} recorded as "
             f"{DEFAULT_CONTENT_TYPE}")
         return DEFAULT_CONTENT_TYPE
     return candidate
@@ -361,15 +567,16 @@ def upload_attachment(
             "attachment of {0} bytes exceeds the {1} byte limit".format(
                 len(file_content), MAX_UPLOAD_BYTES))
     object_name = _build_object_name(filename)
-    logged = _loggable(object_name)
+    logged = _object_id(object_name)
     stored_type = _resolve_content_type(content_type)
     blob = _get_bucket().blob(object_name)
     try:
         blob.upload_from_string(file_content, content_type=stored_type)
     except google_exceptions.GoogleAPIError as e:
-        logger.error(f"Failed to upload {logged}: {_loggable(str(e))}")
+        logger.error(
+            f"Failed to upload object {logged}: {_provider_fault(e)}")
         raise
-    logger.info(f"Uploaded {len(file_content)} bytes to {logged}")
+    logger.info(f"Uploaded {len(file_content)} bytes to object {logged}")
     return blob.public_url
 
 
@@ -396,7 +603,7 @@ async def upload_file(file: UploadFile) -> str:
 
 
 def get_file_content(file_path: str) -> bytes:
-    # Synchronous BY CONTRACT: app/services/ocr_service.py line 8 uses the
+    # Synchronous BY CONTRACT: app/services/ocr_service.py line 7 uses the
     # result directly, feeding it to a Vision image constructor that needs
     # raw bytes. A missing object is logged and RAISED rather than answered
     # with empty bytes, because silently empty OCR input would corrupt every
@@ -406,14 +613,68 @@ def get_file_content(file_path: str) -> bytes:
     # on with its type, traceback, response and retry state intact: a caller
     # can still tell a NotFound from a transport fault, which a substituted
     # exception would have taken away from it.
+    #
+    # THE READ IS BOUNDED, and that bound is why this is not a bare
+    # download_as_bytes(). What comes back goes straight into a Cloud Vision
+    # request, and the identifier arriving here is caller-controlled, so the
+    # SIZE of what it names is not this module's to assume: an object written
+    # before MAX_UPLOAD_BYTES existed, or by anything else holding credentials
+    # for the bucket, would otherwise be materialised whole in this process
+    # before anyone could object to it - and the upload-side ceiling is no
+    # help, because it never saw that object. Asking for the range
+    # 0..MAX_UPLOAD_BYTES requests exactly one byte more than policy allows,
+    # which is what makes an over-sized object detectable without ever holding
+    # it: the refusal below costs one length comparison and happens before the
+    # caller can reach Vision with it.
+    #
+    # raw_download=True is load-bearing rather than a preference. Under
+    # decompressive transcoding - a gzip-stored object served decompressed -
+    # Cloud Storage IGNORES the Range header and returns the whole object, and
+    # the client library then rewinds the stream and writes all of it, so the
+    # ceiling would silently stop applying. A raw download asks for the stored
+    # bytes instead, so the range is honoured. Nothing this module writes sets
+    # a content encoding, so for every object on this path the raw bytes ARE
+    # the object's bytes. checksum=None follows from the same choice: the
+    # provider publishes no checksum for a partial read, so asking for one
+    # would only log that it could not be verified.
+    #
+    # ONE request is also all this needs. Reading the object's metadata first
+    # would cost a second round trip and would then have to be guarded with a
+    # generation precondition to mean anything at all, since the object can
+    # change in between; a single ranged request has no such gap, and the size
+    # that actually matters - how much arrived - is measured from the bytes.
+    #
+    # An empty object is the one case a range cannot satisfy: the provider
+    # answers 416 rather than with an empty body, so that answer is read as
+    # "this object holds nothing", which is what the client library's own
+    # BlobReader does with the same response. A zero-byte attachment is
+    # legitimate - upload_attachment accepts one - so it has to read back.
     object_name = _resolve_object_name(file_path)
-    logged = _loggable(object_name)
+    logged = _object_id(object_name)
     blob = _get_bucket().blob(object_name)
     try:
-        return blob.download_as_bytes()
+        content = blob.download_as_bytes(
+            start=0,
+            end=MAX_UPLOAD_BYTES,
+            raw_download=True,
+            checksum=None,
+        )
+    except google_exceptions.RequestRangeNotSatisfiable:
+        logger.info(f"Object {logged} holds no bytes")
+        return b""
     except google_exceptions.GoogleAPIError as e:
-        logger.error(f"Failed to download {logged}: {_loggable(str(e))}")
+        logger.error(
+            f"Failed to download object {logged}: {_provider_fault(e)}")
         raise
+    if len(content) > MAX_UPLOAD_BYTES:
+        logger.error(
+            f"Object {logged} exceeds the {MAX_UPLOAD_BYTES} byte read "
+            f"limit and was not returned")
+        raise ValueError(
+            "stored object exceeds the {0} byte read limit".format(
+                MAX_UPLOAD_BYTES))
+    logger.info(f"Read {len(content)} bytes from object {logged}")
+    return content
 
 
 def delete_file(file_path: str) -> None:
@@ -424,21 +685,25 @@ def delete_file(file_path: str) -> None:
     # handler comes first - NotFound is a subclass of GoogleAPIError, so the
     # broader handler would otherwise swallow the idempotent case.
     #
-    # As everywhere here, the identifier is validated before the settings
-    # and the bucket are looked up, so a None, blank or bucket-only one
-    # raises ValueError ahead of any configuration read or network access.
+    # As everywhere here, the identifier is validated before any network
+    # access, so a None, blank, foreign, out-of-namespace or bucket-only one
+    # raises ValueError without a request being issued. Validating a URI form
+    # does read the configured bucket name, since that is what the URI is
+    # checked against, but that read is an environment lookup and touches
+    # nothing remote.
     object_name = _resolve_object_name(file_path)
-    logged = _loggable(object_name)
+    logged = _object_id(object_name)
     blob = _get_bucket().blob(object_name)
     try:
         blob.delete()
     except google_exceptions.NotFound:
-        logger.warning(f"Object already absent, not deleted: {logged}")
+        logger.warning(f"Object {logged} already absent, not deleted")
         return
     except google_exceptions.GoogleAPIError as e:
-        logger.error(f"Failed to delete {logged}: {_loggable(str(e))}")
+        logger.error(
+            f"Failed to delete object {logged}: {_provider_fault(e)}")
         raise
-    logger.info(f"Deleted {logged}")
+    logger.info(f"Deleted object {logged}")
 
 
 def file_exists(file_path: str) -> bool:
@@ -447,12 +712,13 @@ def file_exists(file_path: str) -> bool:
     # 404 into False itself. Genuine transport faults are still logged and
     # re-raised, so an unreachable bucket cannot masquerade as an absent one.
     object_name = _resolve_object_name(file_path)
-    logged = _loggable(object_name)
+    logged = _object_id(object_name)
     blob = _get_bucket().blob(object_name)
     try:
         return bool(blob.exists())
     except google_exceptions.GoogleAPIError as e:
-        logger.error(f"Failed to probe {logged}: {_loggable(str(e))}")
+        logger.error(
+            f"Failed to probe object {logged}: {_provider_fault(e)}")
         raise
 
 
@@ -486,8 +752,26 @@ def generate_download_url(
     # out of scope here, so this is reported rather than closed - and it is
     # why the write path returns a canonical URL, which works under the
     # roles/storage.admin grant already in place.
+    #
+    # THE LIFETIME IS A POLICY, CHECKED HERE RATHER THAN LEFT TO THE SIGNER.
+    # A zero or negative number would mint a URL that has already expired,
+    # which fails at whoever was given it rather than at whoever asked for it;
+    # a float or a string reaches timedelta as nonsense; and V4 signing caps a
+    # signature's life at seven days, so a larger number is refused now
+    # instead of after a settings read and a bucket lookup. bool is excluded
+    # explicitly because it is a subclass of int, so True would otherwise be
+    # accepted as one minute. The message carries the bound and never the
+    # value that was rejected.
+    valid_expiration = (
+        isinstance(expiration_minutes, int)
+        and not isinstance(expiration_minutes, bool)
+        and 1 <= expiration_minutes <= MAX_SIGNED_URL_MINUTES)
+    if not valid_expiration:
+        raise ValueError(
+            "expiration_minutes must be an integer of 1 to {0}".format(
+                MAX_SIGNED_URL_MINUTES))
     object_name = _resolve_object_name(file_path)
-    logged = _loggable(object_name)
+    logged = _object_id(object_name)
     blob = _get_bucket().blob(object_name)
     try:
         return blob.generate_signed_url(
@@ -497,5 +781,5 @@ def generate_download_url(
         )
     except google_exceptions.GoogleAPIError as e:
         logger.error(
-            f"Failed to sign a URL for {logged}: {_loggable(str(e))}")
+            f"Failed to sign a URL for object {logged}: {_provider_fault(e)}")
         raise

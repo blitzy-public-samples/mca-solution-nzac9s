@@ -3,20 +3,59 @@
 # envelope. Versions are exact because no lock file constrains them, and
 # some pins encode hard compatibility constraints a range would let a
 # resolver violate. What is declared is the direct dependencies across
-# runtime, deployment and test concerns, plus one provider - bcrypt, in
-# the Security group - whose own declared range admits a release that
-# breaks the package requesting it. Everything else is a resolver result.
+# runtime, deployment and test concerns, plus two providers - starlette in
+# the Web framework group and bcrypt in the Security group - whose own
+# declared ranges admit releases that are unsafe or broken for the package
+# asking for them. Everything else is a resolver result.
+#
+# THAT ENVELOPE IS ALSO THE LIMIT ON WHAT THIS FILE CAN FIX. Python 3.9
+# passed end of life on 31 October 2025, and several upstream projects have
+# since shipped their security fixes only in releases that require Python
+# 3.10 or newer. Wherever an advisory moved a pin forward, that pin is
+# therefore the NEWEST release still installable on 3.9, and its group
+# records both the advisories the move closes and the ones that stay open
+# because their fix is out of reach here. Closing the remainder is a
+# RUNTIME change - ci.yml line 19 and Dockerfile.backend line 2 - and both
+# of those files are out of scope for this fix, so the gap is written down
+# here rather than papered over.
 
 # Web framework
 # pydantic MUST stay below 2.0: app/core/config.py line 1 imports
 # BaseSettings from pydantic, which 2.0 moved out to the separate
 # pydantic-settings package. This pin is what keeps config.py working
-# unedited; fastapi is held below 0.100 to match.
-fastapi==0.99.1
+# unedited, and it is also what bounds fastapi: 0.125.0 is the LAST
+# fastapi release that still accepts pydantic 1.x, because 0.126.0 raised
+# its own floor to pydantic>=2.7.0. Holding fastapi at 0.99.1 was not
+# neutral - it kept CVE-2024-24762 open (fixed in 0.109.1) and, more
+# importantly, held the request parser below at starlette 0.27.0.
+fastapi==0.125.0
 pydantic==1.10.13
+# starlette is a resolver result that is pinned anyway, because it is the
+# code that parses every multipart upload BEFORE any handler runs - and so
+# before storage_service's 20 MB ceiling can refuse anything. fastapi
+# 0.125.0 only asks for starlette>=0.40.0,<0.51.0, a range that still
+# admits releases missing three fixes this pin carries: CVE-2024-47874
+# (multipart denial of service, fixed 0.40.0), CVE-2025-54121 (large
+# uploads spooled on the event loop, fixed 0.47.2) and CVE-2025-62727
+# (quadratic Range-header merging, fixed 0.49.1). 0.49.3 is the last 0.x
+# release that installs on 3.9; the five that remain against it - form
+# limits, Host and authority handling, StaticFiles and endpoint dispatch -
+# are fixed only in starlette 1.x, which requires Python 3.10.
+starlette==0.49.3
 # python-multipart is mandatory, not optional: app/api/attachments.py line 10
 # declares UploadFile = File(...), and uploads reach FastAPI as form data.
-python-multipart==0.0.6
+# 0.0.20 is the last release that installs on 3.9, and it closes the two
+# parser denial-of-service advisories reachable from the upload route:
+# CVE-2024-24762 (Content-Type ReDoS, fixed 0.0.7) and CVE-2024-53981
+# (deformed boundary, fixed 0.0.18). The seven that remain - a file write
+# under a non-default configuration, a large preamble, an unbounded part
+# header, quadratic querystring parsing, the semicolon field separator,
+# RFC 2231 parameter smuggling and a negative Content-Length - are spread
+# across 0.0.22, 0.0.26, 0.0.27, 0.0.30 and 0.0.31, so no single reachable
+# release closes them, and every one of those releases requires Python
+# 3.10: the plainest single cost of the runtime envelope described at the
+# top of this file.
+python-multipart==0.0.20
 uvicorn==0.23.2           # ASGI server named in Dockerfile.backend line 20
 
 # Persistence
@@ -33,6 +72,11 @@ google-cloud-storage==2.14.0
 # can use vision.Image, after vision.types was removed in v2.0.
 google-cloud-vision==3.5.0
 google-cloud-logging==3.9.0    # app/core/logging.py line 2 imports its Client
+# protobuf is left to the resolver on purpose and lands at 4.x, because
+# google-cloud-vision 3.5.0 caps it below 5. Its open advisory
+# CVE-2026-0994 is a recursion-depth bypass in the JSON parser, fixed in
+# 5.29.6; nothing on the storage or OCR path parses protobuf JSON, and
+# pinning it is forbidden here, so it is recorded rather than moved.
 
 # Task queue
 # celery 5.3.4 bounds the broker client at redis>=4.5.2,!=4.5.5,<5.0.0, but
@@ -48,8 +92,15 @@ redis==5.0.1       # broker for CELERY_BROKER_URL at celery_tasks.py line 9
 # Security
 # The cryptography extra is load-bearing, not decorative: it is what
 # makes jose select its cryptography RSA and EC backends and leave the
-# bundled ecdsa one idle.
-python-jose[cryptography]==3.3.0   # JWT at security.py line 2
+# bundled ecdsa one idle - which is also what keeps ecdsa's unfixed timing
+# advisory CVE-2024-23342 off the executed path.
+# 3.3.0 was not safe to keep: CVE-2024-33663 lets an OpenSSH-formatted
+# ECDSA key be confused for an HMAC secret, and CVE-2024-33664 lets a
+# compressed JWE exhaust memory as it is decrypted. Both are fixed in
+# 3.4.0; 3.5.0 is the newest release and still supports 3.9. Nothing in
+# this repository decodes a token yet, so this pin is the prerequisite for
+# writing that decoder rather than a repair to existing behaviour.
+python-jose[cryptography]==3.5.0   # JWT at security.py line 2
 # The bcrypt extra names the backend CryptContext selects, but bounds it
 # only at bcrypt>=3.1.0, so the provider cannot be left to the resolver: a
 # clean Python 3.9 resolve of this manifest takes bcrypt 5.0.0, and under
@@ -68,9 +119,23 @@ passlib[bcrypt]==1.7.4             # CryptContext at security.py line 8
 bcrypt==4.0.1                      # provider of the extra on the line above
 
 # Utilities
-requests==2.31.0       # app/services/webhook_service.py line 1
+# 2.32.5 rather than 2.31.0 because webhook_service.py line 1 posts to a
+# URL a caller registers: CVE-2024-47081 (fixed 2.32.4) hands .netrc
+# credentials to a crafted destination, and CVE-2024-35195 left a Session
+# trusting verify=False after the first such call. The remaining temp-file
+# advisory CVE-2026-25645 is fixed only in 2.33.0, which needs 3.10.
+# urllib3 arrives underneath as a resolver result at 2.6.x, already the
+# newest line for 3.9; its two open advisories are fixed in 2.7.0, also
+# 3.10-only.
+requests==2.32.5       # app/services/webhook_service.py line 1
+# set_key, the only entry point CVE-2026-28684 affects, is never called
+# here: config.py reads settings and nothing in this backend writes an env
+# file. The fix release 1.2.2 requires 3.10, so this pin stays put.
 python-dotenv==1.0.0   # backs env_file = ".env" at app/core/config.py line 15
 
 # Test tooling
+# pytest's temporary-directory advisory CVE-2025-71176 is fixed in 9.0.3,
+# which requires 3.10. It is reachable from a test run on a shared machine,
+# never from the service, so it waits for the runtime move as well.
 pytest==7.4.4      # invoked by ci.yml line 37
 httpx==0.25.2      # backs the FastAPI TestClient at tests/test_api.py line 2
