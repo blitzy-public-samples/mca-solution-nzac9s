@@ -39,6 +39,14 @@ ATTACHMENT_PREFIX = "attachments"
 # honest about what is actually known about the payload.
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 
+# Cloud Storage accepts an object name of 1 to 1024 bytes once UTF-8
+# encoded, and the WHOLE key counts against that - prefix, date partition
+# and uuid4 included, not just the filename. The bound is applied in this
+# module rather than left to the provider so an over-long client filename
+# is caught before an upload is issued instead of surfacing as a rejected
+# request after the write path has been entered.
+MAX_OBJECT_NAME_BYTES = 1024
+
 # The two GCS endpoints that address an object as /<bucket>/<object>: on
 # these the first path segment is the bucket and has to be dropped. The
 # other layout this module emits and accepts is virtual-hosted,
@@ -81,12 +89,30 @@ def _build_object_name(filename: str) -> str:
     # the prefix, and a missing name becomes "unnamed". Printable non-ASCII
     # survives verbatim, because the canonical URL percent-encodes it and
     # _resolve_object_name decodes it back, so the round trip is lossless.
+    #
+    # Its LENGTH is untrusted too, and the key leaving here has to be one the
+    # provider will accept, so whatever is left of MAX_OBJECT_NAME_BYTES once
+    # the fixed part is spent bounds the readable tail. Shortening that tail
+    # rather than refusing the upload is deliberate: the uuid4 already
+    # carries the identity, so nothing that ADDRESSES the object is lost,
+    # while rejecting would cost a merchant a document - or an e-mail poll
+    # its whole run - over a filename attribute. The warning keeps it seen.
     safe_name = (filename or "").strip().replace("\\", "/").replace("/", "_")
     if not safe_name:
         safe_name = "unnamed"
     day = datetime.utcnow().strftime("%Y/%m/%d")
-    return "{0}/{1}/{2}-{3}".format(
-        ATTACHMENT_PREFIX, day, uuid.uuid4().hex, safe_name)
+    prefix = "{0}/{1}/{2}-".format(ATTACHMENT_PREFIX, day, uuid.uuid4().hex)
+    budget = MAX_OBJECT_NAME_BYTES - len(prefix.encode("utf-8"))
+    encoded = safe_name.encode("utf-8")
+    if len(encoded) > budget:
+        # The cut lands on the byte budget, then errors="ignore" discards the
+        # partial sequence it may have severed, so a multi-byte character is
+        # never left half-written into the key.
+        safe_name = encoded[:budget].decode("utf-8", "ignore")
+        logger.warning(
+            f"Filename of {len(encoded)} bytes truncated to {budget} to "
+            f"keep the object name within {MAX_OBJECT_NAME_BYTES} bytes")
+    return prefix + safe_name
 
 
 def _resolve_object_name(file_path: str) -> str:
@@ -108,17 +134,32 @@ def _resolve_object_name(file_path: str) -> str:
     # '%25'. Decoding a bare name would silently rewrite it, turning
     # "abc-report%2Ffinal.pdf" into "abc-report/final.pdf" and addressing a
     # different object on every read, delete, probe and signature.
+    #
+    # EMPTINESS IS JUDGED ON THE RESULT, NOT ON THE INPUT, because every
+    # branch below can make nothing out of something. An identifier naming
+    # only a bucket - gs://<bucket>, either HTTPS layout with nothing past
+    # the bucket, or a lone "/" - is not blank, yet it addresses no object
+    # and reduces to "". Carrying that on would build blob(""), spending a
+    # settings read and a request on an object that cannot exist and
+    # reporting it as a provider fault far from the caller that supplied it.
+    # The normalised name is therefore checked once, after every branch, and
+    # refused here - the same contract the None and blank inputs carry.
     if file_path is None or not file_path.strip():
         raise ValueError("file_path is required to address a stored object")
     candidate = file_path.strip()
     parsed = urlparse(candidate)
     scheme = parsed.scheme.lower()
     if scheme not in ("gs", "http", "https"):
-        return candidate.lstrip("/")
-    path = parsed.path.lstrip("/")
-    if scheme != "gs" and (parsed.hostname or "") in PATH_STYLE_HOSTS:
-        path = path.partition("/")[2]
-    return unquote(path)
+        object_name = candidate.lstrip("/")
+    else:
+        path = parsed.path.lstrip("/")
+        if scheme != "gs" and (parsed.hostname or "") in PATH_STYLE_HOSTS:
+            path = path.partition("/")[2]
+        object_name = unquote(path)
+    if not object_name:
+        raise ValueError(
+            f"file_path addresses no object in the bucket: {candidate}")
+    return object_name
 
 
 def upload_attachment(
@@ -198,8 +239,8 @@ def delete_file(file_path: str) -> None:
     # broader handler would otherwise swallow the idempotent case.
     #
     # As everywhere here, the identifier is validated before the settings
-    # and the bucket are looked up, so a None or blank one raises ValueError
-    # ahead of any configuration read or network access.
+    # and the bucket are looked up, so a None, blank or bucket-only one
+    # raises ValueError ahead of any configuration read or network access.
     object_name = _resolve_object_name(file_path)
     blob = _get_bucket().blob(object_name)
     try:
