@@ -20,9 +20,22 @@
 # google_storage_bucket.mca_documents, named ${var.project_id}-mca-documents.
 # The AWS S3 named in README.md is stale scaffold text with no counterpart in
 # the code, the Terraform, or the technical specification.
+#
+# Everything crossing this boundary is treated as external, which is what the
+# four groups of controls below are for. Every payload moves under
+# MAX_DOCUMENT_BYTES in BOTH directions. Every identifier and content type is
+# refused, on its own type and length, before any configuration is read or any
+# socket is opened. Nothing attacker-chosen is ever quoted: an object name
+# becomes an _object_ref, a rejected identifier becomes a _candidate_ref built
+# from this module's own vocabulary, and a client exception becomes an
+# _error_detail. And no original exception propagates - each is logged once, in
+# full, to the one record this module controls, and replaced by a
+# storage-domain exception carrying only a reference and a status, so a
+# traceback nobody catches cannot publish what the log record withheld.
 
 import hashlib
 import logging
+import re
 import threading
 import uuid
 from datetime import datetime, timedelta
@@ -53,11 +66,68 @@ ATTACHMENT_PREFIX = "attachments"
 # than guessing a type the bytes may not actually have.
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 
+# A content type does not stay inside this process: the Google upload stack
+# concatenates it after a literal "content-type: " when it builds the
+# outbound multipart part header, so a value carrying a carriage return and
+# line feed would append a header of the attacker's choosing (CWE-93). The
+# longest media type this service realistically sees is a forty-odd character
+# Office document type with a charset parameter, so the ceiling below is
+# generous by an order of magnitude and exists to bound the work the pattern
+# match has to do rather than to reject anything genuine.
+MAX_CONTENT_TYPE_CHARACTERS = 255
+
+# RFC 9110 token characters, then a media type built from them: type and
+# subtype, followed by any number of parameters whose value is either a token
+# or a quoted string. The pattern is anchored at both ends and every
+# repetition has to begin with a literal semicolon, so there is no ambiguity
+# for a backtracking engine to explore; the length ceiling above is applied
+# BEFORE the match regardless, so no input can turn this into a ReDoS lever.
+# Control characters cannot reach here at all - _validate_content_type
+# refuses them first - and the quoted-string branch excludes them a second
+# time so the pattern stays correct on its own terms.
+MEDIA_TYPE_TOKEN = r"[0-9A-Za-z!#$%&'*+.^_`|~-]+"
+MEDIA_TYPE_VALUE = r"(?:{0}|\"[^\"\x00-\x1f\x7f]*\")".format(
+    MEDIA_TYPE_TOKEN)
+MEDIA_TYPE_PATTERN = re.compile(
+    r"^{0}/{0}(?:[ \t]*;[ \t]*{0}={1})*$".format(
+        MEDIA_TYPE_TOKEN, MEDIA_TYPE_VALUE))
+
+# The largest document this service will move in either direction. Three
+# independent facts fix it, and the smallest of them governs:
+#
+#   Cloud Vision refuses a file above 20 MB on the inline annotate calls that
+#   ocr_service.py makes, so accepting a larger document would store
+#   something the OCR stage could never read - a silent downstream failure
+#   rather than a refusal the caller can see.
+#
+#   Cloud Run caps an inbound HTTP/1 request at 32 MiB and the deployment in
+#   infrastructure/terraform/main.tf enables no end-to-end HTTP/2, so a
+#   ceiling above that would be unreachable and therefore decorative.
+#
+#   A revision that declares no memory limit gets 512 MiB and serves many
+#   requests concurrently, so a document held whole in memory is charged
+#   against that budget once per request in flight.
+#
+# The ceiling makes the exposure bounded rather than absent: an upstream
+# request-body limit belongs to the proxy and the ASGI server, neither of
+# which this module configures, and a parser-level attack lands before any
+# code here runs. That residual is recorded rather than papered over.
+MAX_DOCUMENT_BYTES = 20 * 1024 * 1024
+
 # Cloud Storage refuses an object name longer than 1024 UTF-8 bytes, so a
 # supplied filename may only occupy what the prefix, the date partition and
 # the UUID leave behind. Enforced on the way in by _build_object_name and on
 # the way back by _resolve_object_name.
 MAX_OBJECT_NAME_BYTES = 1024
+
+# The ceiling on an identifier handed to this service, applied before it is
+# parsed, hashed or quoted anywhere. The longest legitimate value is a signed
+# canonical URL: a 63-character bucket, an object name at its 1024-byte limit
+# expanded to at most 3072 characters by percent-encoding, and a V4 query
+# whose signature alone is 512 hexadecimal characters - under 4000 altogether.
+# Twice that leaves room to spare while denying an unbounded identifier the
+# chance to become an unbounded log record or exception message (CWE-400).
+MAX_IDENTIFIER_CHARACTERS = 8192
 
 # A V4 signature is valid for at most seven days. Naming the ceiling here
 # lets generate_download_url refuse an impossible window before it resolves
@@ -81,6 +151,23 @@ CONTROL_CHARACTERS = frozenset(
 # bucket: see _bucket_relative_path.
 GCS_ENDPOINT_HOSTS = ("storage.googleapis.com", "storage.cloud.google.com")
 
+# The complete vocabulary _candidate_ref may emit for a refused identifier.
+# Every term is a constant of this module, chosen by comparing the identifier
+# against values this service already knows; not one of them is copied out of
+# the identifier. That is the point: a rejected candidate arrives from a
+# database column and may have been chosen by whoever uploaded the document,
+# so reproducing any part of it in a log record or an exception message would
+# publish it (CWE-532) and let its length dictate the size of the record
+# (CWE-400). A fixed term says which rule was broken without repeating the
+# evidence, and _digest supplies a bounded handle for correlating the two.
+SCHEME_CLASSES = ("gs", "https", "http", "other", "absent")
+RECOGNISED_SCHEMES = ("gs", "https", "http")
+HOST_CLASS_CONFIGURED = "configured-bucket"
+HOST_CLASS_KNOWN_GCS = "known-gcs"
+HOST_CLASS_VIRTUAL_HOSTED = "virtual-hosted"
+HOST_CLASS_FOREIGN = "foreign"
+HOST_CLASS_ABSENT = "absent"
+
 # Scope requested for the identity that signs download URLs. cloud-platform
 # is what authorises the IAM signBlob call described in _get_signing_kwargs.
 SIGNING_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
@@ -98,6 +185,52 @@ REF_DIGEST_LENGTH = 16
 # UUID instead of hashing the whole name.
 UUID_HEX_CHARACTERS = frozenset("0123456789abcdef")
 UUID_HEX_LENGTH = 32
+
+
+# The four classes below are type declarations, not a service object: they
+# hold no state and define no behaviour, so the flat module of top-level
+# functions this package is built from is unchanged. They exist because
+# redacting a log record is only half a defence. A Google client exception
+# renders the bucket, the object name and, on the credential path, details of
+# the identity that failed - and neither uvicorn nor a Celery worker
+# sanitises the traceback of an exception nobody caught, so re-raising the
+# original would put every one of those values into a log this module took
+# care to keep them out of (CWE-532). Each public function below therefore
+# logs the full detail once, to the one record it controls, and raises one of
+# these instead, carrying only a correlation handle and a status.
+#
+# They subclass the Google families deliberately rather than incidentally.
+# file_exists reads a miss as False and delete_file reads one as a completed
+# deletion, both by catching NotFound; a caller may reasonably do the same.
+# Substituting an unrelated exception type would break that reading silently,
+# so StorageObjectNotFoundError IS a NotFound and every storage failure IS a
+# GoogleAPIError. The MRO is well defined and the status prefix Google's
+# metaclass adds to the rendered message is exactly the status the redacted
+# message needs to carry.
+class StorageError(google_exceptions.GoogleAPIError):
+    # Base for every storage-side failure this module reports. Nothing
+    # raises it that has a more specific class available.
+    pass
+
+
+class StorageObjectNotFoundError(StorageError, google_exceptions.NotFound):
+    # The addressed object does not exist. Remains catchable as NotFound.
+    pass
+
+
+class StoragePayloadTooLargeError(StorageError):
+    # A stored object exceeds MAX_DOCUMENT_BYTES, so it is refused instead
+    # of being read into memory. An oversized ARGUMENT is a caller error and
+    # raises ValueError instead, before any network call.
+    pass
+
+
+class StorageCredentialsError(google_auth_exceptions.GoogleAuthError):
+    # The active identity cannot be resolved, refreshed, or used to sign.
+    # Kept inside the auth family so generate_download_url's callers can
+    # still tell a credential problem from a storage one.
+    pass
+
 
 # Cached client handle; stays None until the first storage operation runs.
 # See _get_client for why that emptiness at import time is the whole point.
@@ -125,14 +258,14 @@ _refresh_lock = threading.Lock()
 
 def _log_safe(value: str) -> str:
     # Escapes anything that could break out of a single log record before it
-    # is interpolated into one. Its remaining inputs are deliberately narrow:
-    # the configured bucket name and the host of a rejected identifier. It is
-    # NOT what protects a filename, because a filename never reaches a record
-    # at all - _object_ref and _candidate_ref replace those with opaque
-    # values before anything is written. Escaping still matters for what is
-    # left, since an environment variable or a URL host can carry a newline,
-    # and a forged log record is indistinguishable from a genuine one after
-    # the fact (CWE-117).
+    # is interpolated into one. Its remaining input is deliberately narrow:
+    # the configured bucket name, and nothing else. It is NOT what protects a
+    # filename, because a filename never reaches a record at all - _object_ref
+    # and _candidate_ref replace those with opaque values before anything is
+    # written, and _candidate_ref reports a classified origin rather than the
+    # host it was taken from. Escaping still matters for what is left, since
+    # an environment variable can carry a newline, and a forged log record is
+    # indistinguishable from a genuine one after the fact (CWE-117).
     return "".join(
         "\\x{0:02x}".format(ord(char)) if char in CONTROL_CHARACTERS else char
         for char in value
@@ -172,9 +305,53 @@ def _object_ref(object_name: str) -> str:
     return _digest(object_name)
 
 
-def _candidate_ref(parsed: ParseResult, candidate: str) -> str:
-    # Describes a REJECTED identifier without reproducing it, for the
-    # ValueError messages raised by the two resolver helpers below.
+def _scheme_class(parsed: ParseResult) -> str:
+    # Reduces a scheme to one of SCHEME_CLASSES. urlparse accepts any run of
+    # alphanumerics, plus, minus and dot before the colon, so a scheme is
+    # itself an attacker-chosen string of attacker-chosen length; naming the
+    # three this service recognises and calling everything else "other" is
+    # what keeps that string out of the message entirely. The membership test
+    # is against RECOGNISED_SCHEMES rather than the reported vocabulary, so a
+    # scheme spelled "other" or "absent" is classified rather than echoed
+    # back as though it had been recognised.
+    scheme = parsed.scheme.lower()
+    if not scheme:
+        return "absent"
+    if scheme in RECOGNISED_SCHEMES:
+        return scheme
+    return "other"
+
+
+def _host_class(parsed: ParseResult, bucket_name: str) -> str:
+    # Reduces a host to one of the HOST_CLASS_* constants by comparing it
+    # against values this service already holds - the configured bucket and
+    # the two published Cloud Storage endpoints. The comparison is the only
+    # thing the host is used for; the result is a constant of this module.
+    #
+    # hostname rather than netloc is read, so any userinfo in a
+    # "https://user:secret@host/..." form is discarded before the comparison
+    # instead of being classified.
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return HOST_CLASS_ABSENT
+    bucket = bucket_name.lower()
+    if host == bucket:
+        return HOST_CLASS_CONFIGURED
+    if host in GCS_ENDPOINT_HOSTS:
+        return HOST_CLASS_KNOWN_GCS
+    for endpoint in GCS_ENDPOINT_HOSTS:
+        if host == "{0}.{1}".format(bucket, endpoint):
+            return HOST_CLASS_VIRTUAL_HOSTED
+    return HOST_CLASS_FOREIGN
+
+
+def _candidate_ref(
+    parsed: ParseResult,
+    candidate: str,
+    bucket_name: str,
+) -> str:
+    # Describes a REJECTED identifier without reproducing any part of it, for
+    # the ValueError messages raised by the two resolver helpers below.
     #
     # A rejected candidate is the most dangerous string this module handles.
     # It arrives from the storage_url column or a Celery task argument, it may
@@ -186,17 +363,21 @@ def _candidate_ref(parsed: ParseResult, candidate: str) -> str:
     # holds travels into a worker traceback and from there into a log sink.
     # That is precisely how a credential escapes inside an error message.
     #
-    # So the raw value is never echoed. What is reported is the scheme and the
-    # host - enough for an operator to see WHY it was refused, whether that is
-    # a foreign origin, a wrong bucket or an impossible scheme - plus a digest
-    # that ties this message to one specific request. Path, query and fragment
-    # are all dropped. hostname rather than netloc is used, so any userinfo in
-    # a "https://user:secret@host/..." form is dropped with them.
-    origin = "opaque"
-    if parsed.scheme:
-        origin = "{0}://{1}".format(
-            parsed.scheme.lower(), parsed.hostname or "")
-    return "origin={0} ref={1}".format(_log_safe(origin), _digest(candidate))
+    # Nothing is echoed, not even the host. A host is as attacker-chosen as
+    # the rest of the identifier: "https://ssn-123-45-6789.attacker.example/"
+    # would carry personal data into the message on its own, and a host of a
+    # hundred thousand characters would carry a message of a hundred thousand
+    # characters with it (CWE-532, CWE-117, CWE-400). What is reported instead
+    # is a pair of terms drawn from this module's own vocabulary, which is
+    # enough to see WHY the identifier was refused - a foreign origin, the
+    # wrong bucket, an impossible scheme - plus a bounded digest that ties the
+    # message to one specific request. The length ceiling that stops the
+    # digest itself from being fed an unbounded string is applied earlier, in
+    # _validate_identifier, before this function is ever reached.
+    return "origin={0}/{1} ref={2}".format(
+        _scheme_class(parsed),
+        _host_class(parsed, bucket_name),
+        _digest(candidate))
 
 
 def _error_detail(error: BaseException) -> str:
@@ -205,14 +386,144 @@ def _error_detail(error: BaseException) -> str:
     # a google.api_core exception renders itself as the request that failed,
     # so its text carries the full object path (filename included), whatever
     # query parameters that request was signed with, and a verbatim slice of
-    # the response body. The exception object is re-raised untouched, so a
-    # caller that needs the detail still has every byte of it; what changes is
-    # only what this module WRITES DOWN about it.
+    # the response body. That text is not written down anywhere and the
+    # original exception is not propagated either: the helpers below raise a
+    # storage-domain exception in its place and suppress it as a cause, so
+    # this type-and-status summary is the whole of what survives, in the log
+    # record and in the raised message alike.
     detail = type(error).__name__
     code = getattr(error, "code", None)
     if isinstance(code, int):
         detail = "{0}(status={1:d})".format(detail, int(code))
     return detail
+
+
+def _storage_failure(
+    operation: str,
+    object_name: str,
+    bucket_name: str,
+    error: BaseException,
+) -> StorageError:
+    # The single place a storage-side failure becomes both a log record and an
+    # exception, so the two can never drift apart. It LOGS the full internal
+    # context - correlation reference, bucket, failure type and status - to
+    # the one record this module controls, and RETURNS the exception the
+    # caller must raise `from None`, carrying the reference and the status but
+    # not the bucket. Returning rather than raising keeps the `from None` at
+    # the call site, where it is visible, and keeps this function usable from
+    # a handler for a family the new exception itself belongs to.
+    #
+    # NotFound is routed to the subclass that preserves it, because
+    # delete_file and file_exists read a miss as an outcome rather than an
+    # error and a caller may reasonably do the same.
+    detail = _error_detail(error)
+    reference = _object_ref(object_name)
+    logger.error(
+        f"{operation} failed: object={reference} "
+        f"bucket={_log_safe(bucket_name)} error={detail}")
+    message = "{0} failed: object={1} error={2}".format(
+        operation, reference, detail)
+    if isinstance(error, google_exceptions.NotFound):
+        return StorageObjectNotFoundError(message)
+    return StorageError(message)
+
+
+def _credentials_failure(
+    operation: str,
+    error: BaseException,
+) -> StorageCredentialsError:
+    # The credential equivalent of _storage_failure. A google.auth failure
+    # renders the metadata-server URL it queried, the identity it was
+    # answering for and a slice of the refusal body, so the same substitution
+    # applies: type and status are recorded, the original is suppressed.
+    detail = _error_detail(error)
+    logger.error(f"{operation} failed: error={detail}")
+    return StorageCredentialsError(
+        "{0} failed: error={1}".format(operation, detail))
+
+
+def _payload_too_large(
+    operation: str,
+    object_name: str,
+    bucket_name: str,
+    size: Optional[int],
+) -> StoragePayloadTooLargeError:
+    # Refuses a stored object that would not fit the ceiling, before a single
+    # byte of it is read. A size is not sensitive, so it is reported in both
+    # the record and the message; the object is still named by reference only.
+    reported = "unknown" if size is None else "{0:d}".format(size)
+    reference = _object_ref(object_name)
+    logger.error(
+        f"{operation} refused: object={reference} "
+        f"bucket={_log_safe(bucket_name)} size={reported} "
+        f"limit={MAX_DOCUMENT_BYTES}")
+    return StoragePayloadTooLargeError(
+        "{0} refused: object={1} size={2} limit={3}".format(
+            operation, reference, reported, MAX_DOCUMENT_BYTES))
+
+
+def _validate_content_type(content_type: Optional[str]) -> str:
+    # Decides what goes into the outbound part header, and refuses anything
+    # that could add a second header beside it (CWE-93, CWE-20).
+    #
+    # An absent or blank value is not an error: an e-mail part and a browser
+    # upload both routinely omit the header, and DEFAULT_CONTENT_TYPE is the
+    # documented answer for both. Everything else must be a string, must fit
+    # the length ceiling, must contain no control character - which is what
+    # actually forecloses the carriage-return-and-line-feed injection - and
+    # must then match a real media type.
+    #
+    # No refusal quotes the supplied value. It reached this process from a
+    # request header or an e-mail header, so echoing it would put an
+    # attacker-chosen string into whatever renders the ValueError, which is
+    # the same disclosure _candidate_ref exists to prevent for identifiers.
+    if content_type is None:
+        return DEFAULT_CONTENT_TYPE
+    if not isinstance(content_type, str):
+        raise ValueError("content_type must be a string")
+    candidate = content_type.strip()
+    if not candidate:
+        return DEFAULT_CONTENT_TYPE
+    if len(candidate) > MAX_CONTENT_TYPE_CHARACTERS:
+        raise ValueError(
+            "content_type exceeds the {0}-character limit".format(
+                MAX_CONTENT_TYPE_CHARACTERS))
+    if any(char in CONTROL_CHARACTERS for char in candidate):
+        raise ValueError("content_type has control characters")
+    if not MEDIA_TYPE_PATTERN.match(candidate):
+        raise ValueError("content_type is not a valid media type")
+    return candidate
+
+
+def _validate_identifier(file_path: str) -> str:
+    # Everything that can be decided about an identifier without knowing
+    # which bucket is configured, decided FIRST.
+    #
+    # The ordering is the point, not a preference. Reading the bucket name
+    # constructs a Settings object, which validates seven fields that have no
+    # defaults and may consult a .env file; a None or blank file_path that
+    # reached that call first would surface as a pydantic ValidationError
+    # about unrelated configuration instead of the argument error the caller
+    # is owed, and would have done configuration work on behalf of a request
+    # that was never going to be served (CWE-20). The length ceiling belongs
+    # here for the same reason it belongs before parsing: it has to be applied
+    # before the value is parsed, hashed, or quoted in any message.
+    #
+    # str() coercion is deliberately not used. A caller passing a non-string
+    # is a caller with a bug, and coercing would turn that bug into an object
+    # name built out of some object's repr.
+    if file_path is None:
+        raise ValueError("file_path is required to address an object")
+    if not isinstance(file_path, str):
+        raise ValueError("file_path must be a string")
+    if len(file_path) > MAX_IDENTIFIER_CHARACTERS:
+        raise ValueError(
+            "file_path exceeds the {0}-character identifier limit".format(
+                MAX_IDENTIFIER_CHARACTERS))
+    candidate = file_path.strip()
+    if not candidate:
+        raise ValueError("file_path must not be empty")
+    return candidate
 
 
 def _require_setting(name: str, value: str) -> str:
@@ -256,8 +567,12 @@ def _get_bucket_name() -> str:
     # Those two uses must never disagree, which is why neither of them reads
     # the setting directly.
     #
-    # Called EXACTLY ONCE per public operation, at the top, and then passed
-    # down to everything that needs it. That is not tidiness: get_settings()
+    # Called EXACTLY ONCE per public operation, and only after the operation's
+    # arguments have survived the checks that do not need a bucket name -
+    # _validate_identifier, _validate_content_type and the expiration window -
+    # so a request that was never going to be served does no configuration
+    # work at all. It is then passed down to everything that needs it. Calling
+    # it once is not tidiness: get_settings()
     # is not memoised (app/core/config.py lines 18-19), so every call
     # constructs a fresh Settings and re-runs pydantic's validation over the
     # environment and the .env file. When the resolver read the setting for
@@ -332,9 +647,14 @@ def _get_client() -> storage.Client:
 
 def _get_bucket(bucket_name: str) -> storage.Bucket:
     # bucket() builds a local reference and performs no existence check, so
-    # every public call below costs exactly one storage round trip instead of
-    # two. The bucket is provisioned by Terraform, not by this service, so
-    # proving it exists on each request would buy nothing.
+    # an upload costs exactly one storage round trip instead of two. The
+    # bucket is provisioned by Terraform, not by this service, so proving it
+    # exists on each request would buy nothing.
+    #
+    # A read costs two, and deliberately: get_file_content asks for the
+    # object's metadata before it asks for the object, because a size it has
+    # not seen is a size it cannot refuse. That extra round trip buys the
+    # ceiling, and it is the only place in this module that pays it.
     #
     # The name is taken as an argument rather than read here, because the
     # caller has already validated it once through _get_bucket_name and a
@@ -412,15 +732,12 @@ def _bucket_relative_path(
     # to a formality that every candidate satisfies, and the object this
     # request goes on to address is guaranteed to be in the very bucket the
     # identifier was checked against.
-    scheme = parsed.scheme.lower()
-    host = parsed.netloc.lower()
-    path = parsed.path.lstrip("/")
     #
     # Every refusal below reports the candidate through _candidate_ref rather
-    # than quoting it, and none of them repeats a value taken from the PATH -
-    # not the bucket segment a path-style URL carries, and certainly not the
-    # object name. The scheme and host in that reference already say which
-    # rule was broken.
+    # than quoting it, and none of them repeats ANY value taken from the
+    # identifier - not the host, not the bucket segment a path-style URL
+    # carries, and certainly not the object name. The classified origin in
+    # that reference is what says which rule was broken.
     scheme = parsed.scheme.lower()
     host = parsed.netloc.lower()
     path = parsed.path.lstrip("/")
@@ -428,12 +745,13 @@ def _bucket_relative_path(
         if host != bucket_name.lower():
             raise ValueError(
                 "file_path does not name the configured bucket: "
-                "{0}".format(_candidate_ref(parsed, candidate)))
+                "{0}".format(
+                    _candidate_ref(parsed, candidate, bucket_name)))
         return path
     if scheme != "https":
         raise ValueError(
             "file_path uses an unsupported scheme: {0}".format(
-                _candidate_ref(parsed, candidate)))
+                _candidate_ref(parsed, candidate, bucket_name)))
     if host in GCS_ENDPOINT_HOSTS:
         # Path-style: the bucket is the first path segment and has to go,
         # but only once it has been confirmed to be ours.
@@ -441,7 +759,8 @@ def _bucket_relative_path(
         if first != bucket_name or not separator:
             raise ValueError(
                 "file_path does not name the configured bucket: "
-                "{0}".format(_candidate_ref(parsed, candidate)))
+                "{0}".format(
+                    _candidate_ref(parsed, candidate, bucket_name)))
         return remainder
     for endpoint in GCS_ENDPOINT_HOSTS:
         # Virtual-hosted: the bucket is a hostname prefix instead, so the
@@ -451,7 +770,8 @@ def _bucket_relative_path(
             return path
     raise ValueError(
         "file_path is not a Cloud Storage identifier for the configured "
-        "bucket: {0}".format(_candidate_ref(parsed, candidate)))
+        "bucket: {0}".format(
+            _candidate_ref(parsed, candidate, bucket_name)))
 
 
 def _resolve_object_name(file_path: str, bucket_name: str) -> str:
@@ -477,11 +797,14 @@ def _resolve_object_name(file_path: str, bucket_name: str) -> str:
     # None of those refusals quotes the candidate either - see _candidate_ref
     # for why an identifier that reaches this function must be treated as
     # potentially credential-bearing, and for what is reported instead.
-    if file_path is None:
-        raise ValueError("file_path is required to address an object")
-    candidate = str(file_path).strip()
-    if not candidate:
-        raise ValueError("file_path must not be empty")
+    #
+    # _validate_identifier runs first even though every public caller has
+    # already run it. It is cheap, it touches no configuration, and repeating
+    # it keeps this function correct on its own terms rather than on the
+    # strength of a precondition a later caller might forget - which matters
+    # because the length ceiling it applies is what stops an unbounded
+    # identifier reaching urlparse and _digest below.
+    candidate = _validate_identifier(file_path)
     parsed = urlparse(candidate)
     if parsed.scheme:
         path = _bucket_relative_path(parsed, candidate, bucket_name)
@@ -491,16 +814,17 @@ def _resolve_object_name(file_path: str, bucket_name: str) -> str:
     if not object_name.startswith(ATTACHMENT_PREFIX + "/"):
         raise ValueError(
             "file_path does not address an object under '{0}/': {1}".format(
-                ATTACHMENT_PREFIX, _candidate_ref(parsed, candidate)))
+                ATTACHMENT_PREFIX,
+                _candidate_ref(parsed, candidate, bucket_name)))
     segments = object_name.split("/")
     if any(not segment or segment in (".", "..") for segment in segments):
         raise ValueError(
             "file_path has an empty or relative path segment: {0}".format(
-                _candidate_ref(parsed, candidate)))
+                _candidate_ref(parsed, candidate, bucket_name)))
     if any(char in CONTROL_CHARACTERS for char in object_name):
         raise ValueError(
             "file_path has control characters: {0}".format(
-                _candidate_ref(parsed, candidate)))
+                _candidate_ref(parsed, candidate, bucket_name)))
     if len(object_name.encode("utf-8")) > MAX_OBJECT_NAME_BYTES:
         raise ValueError(
             "file_path exceeds the {0}-byte object name limit".format(
@@ -564,10 +888,8 @@ def _resolve_signing_credentials() -> google_auth_credentials.Credentials:
                     credentials, _ = google.auth.default(
                         scopes=list(SIGNING_SCOPES))
                 except google_auth_exceptions.GoogleAuthError as e:
-                    logger.error(
-                        f"Failed to resolve signing credentials: "
-                        f"error={_error_detail(e)}")
-                    raise
+                    raise _credentials_failure(
+                        "Signing credential resolution", e) from None
                 _signing_credentials = credentials
     return _signing_credentials
 
@@ -630,19 +952,19 @@ def _get_signing_kwargs() -> Dict[str, object]:
                 try:
                     credentials.refresh(_get_auth_transport())
                 except google_auth_exceptions.GoogleAuthError as e:
-                    logger.error(
-                        f"Failed to refresh signing credentials: "
-                        f"error={_error_detail(e)}")
-                    raise
+                    raise _credentials_failure(
+                        "Signing credential refresh", e) from None
     email = getattr(credentials, "service_account_email", None)
     token = getattr(credentials, "token", None)
     if not email or email == "default" or not token:
+        # Static text, holding no part of the identity it is complaining
+        # about, so it is safe to raise as written.
         message = (
             "The active credentials cannot sign a download URL: they carry "
             "no private key and no service account identity for the IAM "
             "signBlob API")
         logger.error(message)
-        raise google_auth_exceptions.GoogleAuthError(message)
+        raise StorageCredentialsError(message)
     return {
         "credentials": credentials,
         "service_account_email": email,
@@ -669,8 +991,27 @@ def upload_attachment(
     #
     # An empty payload is a legitimate zero-byte attachment and is uploaded;
     # only None is rejected, and it is rejected before any network call.
+    #
+    # Every argument check below happens BEFORE _build_object_name and
+    # _get_bucket_name, so a refused upload costs no key generation, no
+    # pydantic validation pass over the environment and no .env read.
+    #
+    # The type check is load-bearing rather than decorative. upload_from_string
+    # accepts str as well as bytes and would encode it, but len() on a str
+    # counts CHARACTERS - so a string payload could carry up to three times
+    # the byte ceiling past a check that looked correct. Refusing anything but
+    # a byte payload is what makes the next check mean what it says. Both
+    # legitimate callers already pass bytes: email_processor.py line 45 uses
+    # part.get_payload(decode=True), and upload_file awaits UploadFile.read.
     if file_content is None:
         raise ValueError("file_content is required to upload an attachment")
+    if not isinstance(file_content, (bytes, bytearray)):
+        raise ValueError("file_content must be bytes")
+    if len(file_content) > MAX_DOCUMENT_BYTES:
+        raise ValueError(
+            "file_content exceeds the {0}-byte document limit".format(
+                MAX_DOCUMENT_BYTES))
+    validated_type = _validate_content_type(content_type)
     object_name = _build_object_name(filename)
     bucket_name = _get_bucket_name()
     bucket = _get_bucket(bucket_name)
@@ -678,13 +1019,11 @@ def upload_attachment(
     try:
         blob.upload_from_string(
             file_content,
-            content_type=content_type or DEFAULT_CONTENT_TYPE,
+            content_type=validated_type,
         )
     except google_exceptions.GoogleAPIError as e:
-        logger.error(
-            f"Upload failed: object={_object_ref(object_name)} "
-            f"bucket={_log_safe(bucket_name)} error={_error_detail(e)}")
-        raise
+        raise _storage_failure(
+            "Upload", object_name, bucket_name, e) from None
     logger.info(
         f"Uploaded {len(file_content)} bytes: "
         f"object={_object_ref(object_name)} "
@@ -715,9 +1054,35 @@ async def upload_file(file: UploadFile) -> str:
     # servicing other work immediately and resumes here when the upload
     # finishes. The e-mail path is untouched: it still calls the synchronous
     # function directly from its own thread, where blocking is correct.
+    #
+    # THE BODY IS READ UNDER A CEILING, in two steps that answer two
+    # different questions.
+    #
+    # Starlette's multipart parser rolls a part over one mebibyte into a
+    # SpooledTemporaryFile, which moves the bytes to disk but does not limit
+    # them - the part is fully buffered either way, and reading it whole is
+    # what turns a large upload into resident memory. The parser records what
+    # it buffered on UploadFile.size, so that attribute is consulted FIRST and
+    # an over-large part is refused without reading a single byte of it. It is
+    # read defensively, because a directly constructed UploadFile may leave it
+    # None, and a None or absent size simply falls through to the second step.
+    #
+    # The read itself then asks for one byte MORE than the ceiling and refuses
+    # if it gets it. Asking for the limit exactly cannot distinguish a
+    # document that just fits from one that was truncated, and reading without
+    # a bound would defeat the purpose of having a ceiling at all.
     if file is None:
         raise ValueError("file is required to upload an attachment")
-    file_content = await file.read()
+    declared_size = getattr(file, "size", None)
+    if isinstance(declared_size, int) and declared_size > MAX_DOCUMENT_BYTES:
+        raise ValueError(
+            "file exceeds the {0}-byte document limit".format(
+                MAX_DOCUMENT_BYTES))
+    file_content = await file.read(MAX_DOCUMENT_BYTES + 1)
+    if len(file_content) > MAX_DOCUMENT_BYTES:
+        raise ValueError(
+            "file exceeds the {0}-byte document limit".format(
+                MAX_DOCUMENT_BYTES))
     return await run_in_threadpool(
         upload_attachment, file.filename, file_content, file.content_type)
 
@@ -725,34 +1090,70 @@ async def upload_file(file: UploadFile) -> str:
 def get_file_content(file_path: str) -> bytes:
     # Synchronous BY CONTRACT: app/services/ocr_service.py line 8 uses the
     # result directly, feeding it to a Vision image constructor that needs
-    # raw bytes. A missing object is logged and RE-RAISED rather than
-    # answered with empty bytes, because silently empty OCR input would
-    # corrupt every downstream extraction instead of failing at the fault.
+    # raw bytes. A missing object is logged and RAISED rather than answered
+    # with empty bytes, because silently empty OCR input would corrupt every
+    # downstream extraction instead of failing at the fault. What is raised is
+    # StorageObjectNotFoundError, which still IS a NotFound, so a caller that
+    # reads a miss by catching that family keeps reading it correctly.
+    #
+    # THE OBJECT IS MEASURED BEFORE IT IS READ. download_as_bytes returns
+    # whatever the object holds, and the object arrives from a bucket rather
+    # than from an argument, so its size is not something this process chose:
+    # a caller resolving an identifier out of the storage_url column has no
+    # idea how large the object behind it is, and a Celery worker that
+    # materialises it whole pays for that in resident memory (CWE-400). One
+    # metadata read answers the question first, and an object over the ceiling
+    # is refused without a byte of it being transferred.
+    #
+    # The download is then PINNED to the generation the metadata described.
+    # Without that, the two calls are a time-of-check-to-time-of-use pair: an
+    # object replaced between them would be measured small and delivered
+    # large. if_generation_match turns that race into a precondition failure
+    # instead of an oversized body, and it is used in preference to a ranged
+    # read for a second reason - Cloud Storage omits its checksum header on a
+    # ranged response, and the client library responds by silently swapping in
+    # a do-nothing hash, so bounding the read that way would quietly buy the
+    # ceiling at the cost of end-to-end integrity verification.
+    candidate = _validate_identifier(file_path)
     bucket_name = _get_bucket_name()
-    object_name = _resolve_object_name(file_path, bucket_name)
+    object_name = _resolve_object_name(candidate, bucket_name)
     bucket = _get_bucket(bucket_name)
     blob = bucket.blob(object_name)
     try:
-        return blob.download_as_bytes()
-    except google_exceptions.NotFound as e:
-        logger.error(
-            f"Object not found: object={_object_ref(object_name)} "
-            f"bucket={_log_safe(bucket_name)} error={_error_detail(e)}")
-        raise
+        blob.reload()
     except google_exceptions.GoogleAPIError as e:
-        logger.error(
-            f"Download failed: object={_object_ref(object_name)} "
-            f"bucket={_log_safe(bucket_name)} error={_error_detail(e)}")
-        raise
+        raise _storage_failure(
+            "Metadata read", object_name, bucket_name, e) from None
+    size = blob.size
+    if size is None or size > MAX_DOCUMENT_BYTES:
+        # Raised OUTSIDE the try blocks on purpose: StoragePayloadTooLargeError
+        # is a GoogleAPIError, so raising it inside one would be caught by that
+        # handler and re-reported as an ordinary storage fault. An unknown size
+        # is refused with it, because a ceiling that cannot be evaluated has
+        # not been enforced.
+        raise _payload_too_large(
+            "Download", object_name, bucket_name, size)
+    try:
+        return blob.download_as_bytes(if_generation_match=blob.generation)
+    except google_exceptions.GoogleAPIError as e:
+        raise _storage_failure(
+            "Download", object_name, bucket_name, e) from None
 
 
 def delete_file(file_path: str) -> None:
     # Deletion is idempotent on purpose, and this is the ONE place in this
-    # module that does not re-raise: an object that is already gone satisfies
+    # module that does not raise: an object that is already gone satisfies
     # the caller's intent, so a miss is a warning rather than a failure. Any
-    # other API fault still surfaces.
+    # other API fault still surfaces. That NotFound branch is also why the
+    # storage-domain exceptions subclass the Google families rather than
+    # replacing them - the handler above it has to keep matching.
+    #
+    # The identifier is validated before the bucket name is read, so a caller
+    # passing None or a blank string is told exactly that instead of being
+    # answered with a configuration error about seven unrelated fields.
+    candidate = _validate_identifier(file_path)
     bucket_name = _get_bucket_name()
-    object_name = _resolve_object_name(file_path, bucket_name)
+    object_name = _resolve_object_name(candidate, bucket_name)
     bucket = _get_bucket(bucket_name)
     blob = bucket.blob(object_name)
     try:
@@ -763,10 +1164,8 @@ def delete_file(file_path: str) -> None:
             f"bucket={_log_safe(bucket_name)}")
         return
     except google_exceptions.GoogleAPIError as e:
-        logger.error(
-            f"Delete failed: object={_object_ref(object_name)} "
-            f"bucket={_log_safe(bucket_name)} error={_error_detail(e)}")
-        raise
+        raise _storage_failure(
+            "Delete", object_name, bucket_name, e) from None
     logger.info(
         f"Deleted: object={_object_ref(object_name)} "
         f"bucket={_log_safe(bucket_name)}")
@@ -775,10 +1174,15 @@ def delete_file(file_path: str) -> None:
 def file_exists(file_path: str) -> bool:
     # A miss is an answer here, not a failure, so this returns False and lets
     # callers branch on it without a try block. Genuine transport faults are
-    # still logged and re-raised, so an unreachable bucket can never
-    # masquerade as an absent object.
+    # still logged and raised, so an unreachable bucket can never masquerade
+    # as an absent object. As in delete_file, that NotFound branch is why the
+    # storage-domain exceptions stay inside the Google families.
+    #
+    # The identifier is validated before the bucket name is read, so an
+    # unusable argument costs no configuration work.
+    candidate = _validate_identifier(file_path)
     bucket_name = _get_bucket_name()
-    object_name = _resolve_object_name(file_path, bucket_name)
+    object_name = _resolve_object_name(candidate, bucket_name)
     bucket = _get_bucket(bucket_name)
     blob = bucket.blob(object_name)
     try:
@@ -786,10 +1190,8 @@ def file_exists(file_path: str) -> bool:
     except google_exceptions.NotFound:
         return False
     except google_exceptions.GoogleAPIError as e:
-        logger.error(
-            f"Existence probe failed: object={_object_ref(object_name)} "
-            f"bucket={_log_safe(bucket_name)} error={_error_detail(e)}")
-        raise
+        raise _storage_failure(
+            "Existence probe", object_name, bucket_name, e) from None
 
 
 def generate_download_url(
@@ -807,12 +1209,30 @@ def generate_download_url(
     # Refusing it here keeps an impossible request cheap and its error
     # specific, and it is the same argument-before-I/O rule the rest of this
     # module follows.
+    #
+    # THE TYPE IS SETTLED BEFORE THE RANGE, and that ordering is the check
+    # rather than a preamble to it. A range test is a pair of comparisons, and
+    # every comparison against a not-a-number is false - so float("nan") is
+    # neither below one nor above the ceiling, walks through both, and is
+    # discovered only when timedelta rejects it, by which point Application
+    # Default Credentials have been resolved and possibly a token refreshed on
+    # behalf of a request that was never valid (CWE-20). Requiring an integer
+    # first excludes NaN and both infinities by construction, along with every
+    # other float: the annotation says int, a fractional minute has no meaning
+    # for a window measured in minutes, and accepting one would only re-open
+    # the hole. bool is excluded explicitly because it is a subclass of int in
+    # Python, and True would otherwise pass as a one-minute window.
+    if (isinstance(expiration_minutes, bool)
+            or not isinstance(expiration_minutes, int)):
+        raise ValueError(
+            "expiration_minutes must be an integer number of minutes")
     if expiration_minutes < 1 or expiration_minutes > MAX_EXPIRATION_MINUTES:
         raise ValueError(
             "expiration_minutes must be between 1 and {0}".format(
                 MAX_EXPIRATION_MINUTES))
+    candidate = _validate_identifier(file_path)
     bucket_name = _get_bucket_name()
-    object_name = _resolve_object_name(file_path, bucket_name)
+    object_name = _resolve_object_name(candidate, bucket_name)
     signing_kwargs = _get_signing_kwargs()
     bucket = _get_bucket(bucket_name)
     blob = bucket.blob(object_name)
@@ -823,14 +1243,14 @@ def generate_download_url(
             method="GET",
             **signing_kwargs
         )
-    except (
-        google_auth_exceptions.GoogleAuthError,
-        google_exceptions.GoogleAPIError,
-    ) as e:
-        # Both families are expected here and neither is swallowed: an
-        # unauthorised signBlob call arrives as a GoogleAuthError, while a
-        # storage-side fault arrives as a GoogleAPIError.
-        logger.error(
-            f"Signing failed: object={_object_ref(object_name)} "
-            f"bucket={_log_safe(bucket_name)} error={_error_detail(e)}")
-        raise
+    except google_auth_exceptions.GoogleAuthError as e:
+        # Both families are expected here and neither is swallowed, but they
+        # are no longer conflated: an unauthorised signBlob call arrives as a
+        # GoogleAuthError and stays inside the auth family, while a
+        # storage-side fault arrives as a GoogleAPIError and stays inside
+        # that one, so a caller can still tell a credential problem from a
+        # storage problem after the substitution.
+        raise _credentials_failure("Signing", e) from None
+    except google_exceptions.GoogleAPIError as e:
+        raise _storage_failure(
+            "Signing", object_name, bucket_name, e) from None
