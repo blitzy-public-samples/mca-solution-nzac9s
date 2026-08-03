@@ -21,7 +21,9 @@
 # The AWS S3 named in README.md is stale scaffold text with no counterpart in
 # the code, the Terraform, or the technical specification.
 
+import hashlib
 import logging
+import threading
 import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Optional
@@ -29,6 +31,7 @@ from urllib.parse import ParseResult, unquote, urlparse
 
 import google.auth
 from fastapi import UploadFile
+from fastapi.concurrency import run_in_threadpool
 from google.api_core import exceptions as google_exceptions
 from google.auth import credentials as google_auth_credentials
 from google.auth import exceptions as google_auth_exceptions
@@ -82,6 +85,20 @@ GCS_ENDPOINT_HOSTS = ("storage.googleapis.com", "storage.cloud.google.com")
 # is what authorises the IAM signBlob call described in _get_signing_kwargs.
 SIGNING_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
 
+# How many hexadecimal characters of a SHA-256 digest stand in for an
+# identifier that must be named in a log record or an error message. Sixteen
+# is 64 bits - far more than enough to tell two documents apart in a support
+# conversation - while the digest itself remains one way, which is the whole
+# point: the value in the record cannot be turned back into the filename it
+# refers to. See _digest.
+REF_DIGEST_LENGTH = 16
+
+# The shape of the token _build_object_name puts in front of every key it
+# generates, so that _object_ref can recognise its own work and quote the
+# UUID instead of hashing the whole name.
+UUID_HEX_CHARACTERS = frozenset("0123456789abcdef")
+UUID_HEX_LENGTH = 32
+
 # Cached client handle; stays None until the first storage operation runs.
 # See _get_client for why that emptiness at import time is the whole point.
 _client = None
@@ -90,18 +107,112 @@ _client = None
 # empty until then, for the same import-time reason as _client above.
 _signing_credentials = None
 
+# Cached authentication transport, built on the first credential refresh and
+# reused afterwards. See _get_auth_transport.
+_auth_request = None
+
+# The three caches above are read by every worker thread this process runs -
+# uvicorn's request pool, the thread run_in_threadpool hands uploads to, and
+# each Celery worker thread - so "if it is None, build it" is a race, not an
+# initialisation. Each guard below turns its cache into a
+# build-exactly-once, and they are SEPARATE locks on purpose: a request
+# waiting for a storage client must not queue behind an unrelated token
+# refresh. None of them is ever held across a Cloud Storage or IAM call.
+_client_lock = threading.Lock()
+_credentials_lock = threading.Lock()
+_refresh_lock = threading.Lock()
+
 
 def _log_safe(value: str) -> str:
     # Escapes anything that could break out of a single log record before it
-    # is interpolated into one. Both name producers below already refuse
-    # control characters, so this is the second line of defence rather than
-    # the first - but a log file is the wrong place to discover that the
-    # first one was bypassed, because a forged record is indistinguishable
-    # from a genuine one after the fact (CWE-117).
+    # is interpolated into one. Its remaining inputs are deliberately narrow:
+    # the configured bucket name and the host of a rejected identifier. It is
+    # NOT what protects a filename, because a filename never reaches a record
+    # at all - _object_ref and _candidate_ref replace those with opaque
+    # values before anything is written. Escaping still matters for what is
+    # left, since an environment variable or a URL host can carry a newline,
+    # and a forged log record is indistinguishable from a genuine one after
+    # the fact (CWE-117).
     return "".join(
         "\\x{0:02x}".format(ord(char)) if char in CONTROL_CHARACTERS else char
         for char in value
     )
+
+
+def _digest(value: str) -> str:
+    # One way, stable, and short enough to quote. Two records about the same
+    # object carry the same digest, so an operator can still join them
+    # together, but nothing in the digest says what the object was called.
+    encoded = value.encode("utf-8", "replace")
+    return "sha256:{0}".format(
+        hashlib.sha256(encoded).hexdigest()[:REF_DIGEST_LENGTH])
+
+
+def _object_ref(object_name: str) -> str:
+    # The correlation value that stands in for an object name in EVERY record
+    # this module writes, because an object name ends in the filename the
+    # merchant supplied. Those filenames describe the document and often the
+    # person - "Jane_Doe_SSN-1234_tax_return.pdf" is an entirely ordinary one
+    # for a funding application - so writing one into a log line copies
+    # personal data out of a private bucket and into a log sink with a
+    # different audience, a different retention period and, in this
+    # deployment, a different access-control story altogether. High-cardinality
+    # document metadata in a log index is a disclosure, not a diagnostic.
+    #
+    # The uuid4 token _build_object_name already places in front of every key
+    # is preferred wherever it is present: it is unique per object, contains
+    # nothing of the filename, and one prefix listing turns it back into the
+    # object when an operator legitimately needs to. An identifier this module
+    # did not generate carries no such token, so it is reduced to a digest of
+    # itself instead - correlatable, never reversible.
+    token = object_name.rsplit("/", 1)[-1].split("-", 1)[0]
+    if (len(token) == UUID_HEX_LENGTH
+            and set(token) <= UUID_HEX_CHARACTERS):
+        return token
+    return _digest(object_name)
+
+
+def _candidate_ref(parsed: ParseResult, candidate: str) -> str:
+    # Describes a REJECTED identifier without reproducing it, for the
+    # ValueError messages raised by the two resolver helpers below.
+    #
+    # A rejected candidate is the most dangerous string this module handles.
+    # It arrives from the storage_url column or a Celery task argument, it may
+    # well be a signed URL, and a signed URL keeps its authorisation IN THE
+    # QUERY STRING: X-Goog-Signature together with X-Goog-Credential is a
+    # bearer token for the object it names. get_file_content resolves the
+    # identifier OUTSIDE its try block, and neither app/services/ocr_service.py
+    # nor app/tasks/celery_tasks.py catches ValueError, so whatever this text
+    # holds travels into a worker traceback and from there into a log sink.
+    # That is precisely how a credential escapes inside an error message.
+    #
+    # So the raw value is never echoed. What is reported is the scheme and the
+    # host - enough for an operator to see WHY it was refused, whether that is
+    # a foreign origin, a wrong bucket or an impossible scheme - plus a digest
+    # that ties this message to one specific request. Path, query and fragment
+    # are all dropped. hostname rather than netloc is used, so any userinfo in
+    # a "https://user:secret@host/..." form is dropped with them.
+    origin = "opaque"
+    if parsed.scheme:
+        origin = "{0}://{1}".format(
+            parsed.scheme.lower(), parsed.hostname or "")
+    return "origin={0} ref={1}".format(_log_safe(origin), _digest(candidate))
+
+
+def _error_detail(error: BaseException) -> str:
+    # Names a failure by its type and, where the client library exposes one,
+    # its numeric status - and nothing else. str(error) is never interpolated:
+    # a google.api_core exception renders itself as the request that failed,
+    # so its text carries the full object path (filename included), whatever
+    # query parameters that request was signed with, and a verbatim slice of
+    # the response body. The exception object is re-raised untouched, so a
+    # caller that needs the detail still has every byte of it; what changes is
+    # only what this module WRITES DOWN about it.
+    detail = type(error).__name__
+    code = getattr(error, "code", None)
+    if isinstance(code, int):
+        detail = "{0}(status={1:d})".format(detail, int(code))
+    return detail
 
 
 def _require_setting(name: str, value: str) -> str:
@@ -144,6 +255,17 @@ def _get_bucket_name() -> str:
     # bucket and to decide whether an inbound identifier names our bucket.
     # Those two uses must never disagree, which is why neither of them reads
     # the setting directly.
+    #
+    # Called EXACTLY ONCE per public operation, at the top, and then passed
+    # down to everything that needs it. That is not tidiness: get_settings()
+    # is not memoised (app/core/config.py lines 18-19), so every call
+    # constructs a fresh Settings and re-runs pydantic's validation over the
+    # environment and the .env file. When the resolver read the setting for
+    # itself and _get_bucket read it again, one canonical-URL read, delete,
+    # existence probe or signature paid for two of those passes before it
+    # reached the network. Threading one already-validated value through
+    # instead also guarantees the two uses above see the SAME name even if
+    # the environment were mutated mid-request.
     return _require_setting(
         "GOOGLE_CLOUD_STORAGE_BUCKET",
         get_settings().GOOGLE_CLOUD_STORAGE_BUCKET)
@@ -190,18 +312,35 @@ def _get_client() -> storage.Client:
     # Both are deployment facts rather than code defects, recorded at the
     # point of use because infrastructure/terraform/ is not modified from
     # here and neither one can be repaired in Python.
+    #
+    # The build is double-checked under a lock because "cached" and "built
+    # once" are not the same claim. A cold start serves its first requests
+    # concurrently, and an unguarded check-then-set lets every one of those
+    # threads see None, construct its own storage.Client, resolve
+    # Application Default Credentials for itself, and then overwrite the
+    # cache - so the very burst that most needs a warm connection pool is
+    # the one that fragments into N of them and pays N metadata round trips.
+    # The fast path stays a plain read of the global: the lock is taken only
+    # while the cache is still empty.
     global _client
     if _client is None:
-        _client = storage.Client(project=_get_project_id())
+        with _client_lock:
+            if _client is None:
+                _client = storage.Client(project=_get_project_id())
     return _client
 
 
-def _get_bucket() -> storage.Bucket:
+def _get_bucket(bucket_name: str) -> storage.Bucket:
     # bucket() builds a local reference and performs no existence check, so
     # every public call below costs exactly one storage round trip instead of
     # two. The bucket is provisioned by Terraform, not by this service, so
     # proving it exists on each request would buy nothing.
-    return _get_client().bucket(_get_bucket_name())
+    #
+    # The name is taken as an argument rather than read here, because the
+    # caller has already validated it once through _get_bucket_name and a
+    # second read would repeat a whole pydantic validation pass for a value
+    # it is already holding.
+    return _get_client().bucket(bucket_name)
 
 
 def _build_object_name(filename: str) -> str:
@@ -243,7 +382,11 @@ def _build_object_name(filename: str) -> str:
     return stem + safe_name
 
 
-def _bucket_relative_path(parsed: ParseResult, candidate: str) -> str:
+def _bucket_relative_path(
+    parsed: ParseResult,
+    candidate: str,
+    bucket_name: str,
+) -> str:
     # Reduces a URI form to the still-encoded object path it addresses, and
     # refuses anything this service could not have emitted.
     #
@@ -259,35 +402,46 @@ def _bucket_relative_path(parsed: ParseResult, candidate: str) -> str:
     #
     # urlparse has already separated the query string, which is how a signed
     # URL's X-Goog-* parameters get discarded. The path stays percent-encoded
-    # for now so that an encoded separator cannot masquerade as a real one
-    # while the bucket segment is removed; _resolve_object_name decodes it
+    # at this stage so that an encoded separator cannot masquerade as a real
+    # one while the bucket segment is removed; _resolve_object_name decodes it
     # once that segment is gone.
     #
-    # The name compared against arrives through _get_bucket_name rather than
-    # from the setting directly, so a blank configuration value cannot reduce
-    # the comparison below to a formality that every candidate satisfies.
+    # The name compared against is the one the calling public function
+    # already validated through _get_bucket_name, handed down rather than
+    # re-read: a blank configuration value cannot reduce the comparison below
+    # to a formality that every candidate satisfies, and the object this
+    # request goes on to address is guaranteed to be in the very bucket the
+    # identifier was checked against.
     scheme = parsed.scheme.lower()
     host = parsed.netloc.lower()
     path = parsed.path.lstrip("/")
-    bucket_name = _get_bucket_name()
+    #
+    # Every refusal below reports the candidate through _candidate_ref rather
+    # than quoting it, and none of them repeats a value taken from the PATH -
+    # not the bucket segment a path-style URL carries, and certainly not the
+    # object name. The scheme and host in that reference already say which
+    # rule was broken.
+    scheme = parsed.scheme.lower()
+    host = parsed.netloc.lower()
+    path = parsed.path.lstrip("/")
     if scheme == "gs":
         if host != bucket_name.lower():
             raise ValueError(
-                "file_path names bucket '{0}', not the configured "
-                "bucket: {1}".format(host, _log_safe(candidate)))
+                "file_path does not name the configured bucket: "
+                "{0}".format(_candidate_ref(parsed, candidate)))
         return path
     if scheme != "https":
         raise ValueError(
-            "file_path uses unsupported scheme '{0}': {1}".format(
-                scheme, _log_safe(candidate)))
+            "file_path uses an unsupported scheme: {0}".format(
+                _candidate_ref(parsed, candidate)))
     if host in GCS_ENDPOINT_HOSTS:
         # Path-style: the bucket is the first path segment and has to go,
         # but only once it has been confirmed to be ours.
         first, separator, remainder = path.partition("/")
         if first != bucket_name or not separator:
             raise ValueError(
-                "file_path names bucket '{0}', not the configured "
-                "bucket: {1}".format(first, _log_safe(candidate)))
+                "file_path does not name the configured bucket: "
+                "{0}".format(_candidate_ref(parsed, candidate)))
         return remainder
     for endpoint in GCS_ENDPOINT_HOSTS:
         # Virtual-hosted: the bucket is a hostname prefix instead, so the
@@ -297,10 +451,10 @@ def _bucket_relative_path(parsed: ParseResult, candidate: str) -> str:
             return path
     raise ValueError(
         "file_path is not a Cloud Storage identifier for the configured "
-        "bucket: {0}".format(_log_safe(candidate)))
+        "bucket: {0}".format(_candidate_ref(parsed, candidate)))
 
 
-def _resolve_object_name(file_path: str) -> str:
+def _resolve_object_name(file_path: str, bucket_name: str) -> str:
     # Callers legitimately hand back whatever this service emitted. The
     # canonical URL returned by the upload functions is persisted in
     # Attachment.storage_url (app/db/models.py line 50), travels through the
@@ -319,6 +473,10 @@ def _resolve_object_name(file_path: str) -> str:
     # outside that namespace, a relative or empty segment, a control
     # character or an over-long name is refused here rather than turned into
     # a read, a deletion, a probe or a signature over an unintended object.
+    #
+    # None of those refusals quotes the candidate either - see _candidate_ref
+    # for why an identifier that reaches this function must be treated as
+    # potentially credential-bearing, and for what is reported instead.
     if file_path is None:
         raise ValueError("file_path is required to address an object")
     candidate = str(file_path).strip()
@@ -326,28 +484,92 @@ def _resolve_object_name(file_path: str) -> str:
         raise ValueError("file_path must not be empty")
     parsed = urlparse(candidate)
     if parsed.scheme:
-        path = _bucket_relative_path(parsed, candidate)
+        path = _bucket_relative_path(parsed, candidate, bucket_name)
     else:
         path = candidate.lstrip("/")
     object_name = unquote(path)
     if not object_name.startswith(ATTACHMENT_PREFIX + "/"):
         raise ValueError(
             "file_path does not address an object under '{0}/': {1}".format(
-                ATTACHMENT_PREFIX, _log_safe(candidate)))
+                ATTACHMENT_PREFIX, _candidate_ref(parsed, candidate)))
     segments = object_name.split("/")
     if any(not segment or segment in (".", "..") for segment in segments):
         raise ValueError(
             "file_path has an empty or relative path segment: {0}".format(
-                _log_safe(candidate)))
+                _candidate_ref(parsed, candidate)))
     if any(char in CONTROL_CHARACTERS for char in object_name):
         raise ValueError(
             "file_path has control characters: {0}".format(
-                _log_safe(candidate)))
+                _candidate_ref(parsed, candidate)))
     if len(object_name.encode("utf-8")) > MAX_OBJECT_NAME_BYTES:
         raise ValueError(
             "file_path exceeds the {0}-byte object name limit".format(
                 MAX_OBJECT_NAME_BYTES))
     return object_name
+
+
+def _get_auth_transport() -> google_auth_transport.Request:
+    # One transport for the life of the process. google.auth's Request builds
+    # itself a brand-new requests.Session whenever it is constructed without
+    # one, and a Session is where the connection pool lives - so building a
+    # Request per refresh discards the pooled connection and its TLS handshake
+    # every time, on a metadata call that sits directly on the critical path
+    # of a signed URL.
+    #
+    # Called only while _refresh_lock is held, which is what serialises its
+    # construction; it deliberately has no lock of its own.
+    global _auth_request
+    if _auth_request is None:
+        _auth_request = google_auth_transport.Request()
+    return _auth_request
+
+
+def _needs_refresh(
+    credentials: google_auth_credentials.Credentials,
+) -> bool:
+    # A token is refreshed when it is actually unusable, never on principle.
+    # credentials.valid is the same gate google-auth applies internally in
+    # Credentials._blocking_refresh: a token is present AND is not yet within
+    # the library's own refresh threshold of its expiry. Refreshing a token
+    # that still satisfies that is pure cost - on Cloud Run the metadata
+    # server is allowed up to five three-second attempts - and it buys
+    # nothing, because the signature that follows would have been produced
+    # with the same token either way.
+    #
+    # The second condition is an identity question rather than an expiry one:
+    # a compute-engine credential reports service_account_email as the
+    # literal string "default" until a refresh has answered with the real
+    # address, and the IAM signBlob route cannot name a signer with a
+    # placeholder. So a credential that is otherwise valid but still
+    # anonymous is refreshed once to learn who it is.
+    if not credentials.valid:
+        return True
+    email = getattr(credentials, "service_account_email", None)
+    return email == "default"
+
+
+def _resolve_signing_credentials() -> google_auth_credentials.Credentials:
+    # Double-checked under its own lock, for the reason given in _get_client
+    # and with a sharper edge: concurrent first signatures would each run
+    # Application Default Credentials discovery AND then each refresh their
+    # own copy, so a burst would turn one shared token into N tokens minted
+    # in parallel while N threads overwrote the same cache. Resolution is
+    # serialised here; the signBlob call it enables happens later, in
+    # generate_download_url, outside every lock.
+    global _signing_credentials
+    if _signing_credentials is None:
+        with _credentials_lock:
+            if _signing_credentials is None:
+                try:
+                    credentials, _ = google.auth.default(
+                        scopes=list(SIGNING_SCOPES))
+                except google_auth_exceptions.GoogleAuthError as e:
+                    logger.error(
+                        f"Failed to resolve signing credentials: "
+                        f"error={_error_detail(e)}")
+                    raise
+                _signing_credentials = credentials
+    return _signing_credentials
 
 
 def _get_signing_kwargs() -> Dict[str, object]:
@@ -364,13 +586,13 @@ def _get_signing_kwargs() -> Dict[str, object]:
     #
     # The supported keyless route is the IAM signBlob API, and the pinned
     # client takes it only when BOTH service_account_email and access_token
-    # are supplied - which is what this helper supplies. The credential is
-    # refreshed first for two reasons: the token has to be current, and a
-    # compute-engine credential reports its service_account_email as the
-    # literal string "default" until the metadata server has answered. A
+    # are supplied - which is what this helper supplies. It refreshes the
+    # credential only when _needs_refresh says the token is unusable or the
+    # identity is still the compute-engine placeholder, so a warm cached token
+    # is reused across signatures instead of being reminted for each one. A
     # credential that CAN sign locally, such as a service-account key or an
-    # impersonated identity, is passed through untouched instead, so a
-    # deployment that grows a signing key needs no change here.
+    # impersonated identity, is returned untouched and never refreshed at all,
+    # so a deployment that grows a signing key needs no change here.
     #
     # STILL UNMET INFRASTRUCTURE PREREQUISITES, and there are three of them
     # rather than one. signBlob needs the IAM Service Account Credentials API
@@ -392,23 +614,28 @@ def _get_signing_kwargs() -> Dict[str, object]:
     # storage_url column: a canonical URL needs no signing credential at all,
     # only ordinary object permissions on whichever identity is in force, so
     # it is the form least able to break on this deployment.
-    global _signing_credentials
-    if _signing_credentials is None:
-        try:
-            _signing_credentials, _ = google.auth.default(
-                scopes=list(SIGNING_SCOPES))
-        except google_auth_exceptions.GoogleAuthError as e:
-            logger.error(f"Failed to resolve signing credentials: {str(e)}")
-            raise
-    if isinstance(_signing_credentials, google_auth_credentials.Signing):
-        return {"credentials": _signing_credentials}
-    try:
-        _signing_credentials.refresh(google_auth_transport.Request())
-    except google_auth_exceptions.GoogleAuthError as e:
-        logger.error(f"Failed to refresh signing credentials: {str(e)}")
-        raise
-    email = getattr(_signing_credentials, "service_account_email", None)
-    token = getattr(_signing_credentials, "token", None)
+    credentials = _resolve_signing_credentials()
+    if isinstance(credentials, google_auth_credentials.Signing):
+        return {"credentials": credentials}
+    if _needs_refresh(credentials):
+        with _refresh_lock:
+            # Re-checked inside the lock so that a burst of requests which all
+            # saw the same stale token performs ONE refresh between them
+            # rather than one each, and so that no two of them mutate the
+            # shared credential's token and expiry at the same moment. Only
+            # the refresh is serialised - the signBlob round trip stays
+            # outside, in generate_download_url, or one slow IAM call would
+            # hold up every other signature in the process.
+            if _needs_refresh(credentials):
+                try:
+                    credentials.refresh(_get_auth_transport())
+                except google_auth_exceptions.GoogleAuthError as e:
+                    logger.error(
+                        f"Failed to refresh signing credentials: "
+                        f"error={_error_detail(e)}")
+                    raise
+    email = getattr(credentials, "service_account_email", None)
+    token = getattr(credentials, "token", None)
     if not email or email == "default" or not token:
         message = (
             "The active credentials cannot sign a download URL: they carry "
@@ -417,7 +644,7 @@ def _get_signing_kwargs() -> Dict[str, object]:
         logger.error(message)
         raise google_auth_exceptions.GoogleAuthError(message)
     return {
-        "credentials": _signing_credentials,
+        "credentials": credentials,
         "service_account_email": email,
         "access_token": token,
     }
@@ -445,7 +672,8 @@ def upload_attachment(
     if file_content is None:
         raise ValueError("file_content is required to upload an attachment")
     object_name = _build_object_name(filename)
-    bucket = _get_bucket()
+    bucket_name = _get_bucket_name()
+    bucket = _get_bucket(bucket_name)
     blob = bucket.blob(object_name)
     try:
         blob.upload_from_string(
@@ -454,12 +682,13 @@ def upload_attachment(
         )
     except google_exceptions.GoogleAPIError as e:
         logger.error(
-            f"Failed to upload {_log_safe(object_name)} to "
-            f"{bucket.name}: {str(e)}")
+            f"Upload failed: object={_object_ref(object_name)} "
+            f"bucket={_log_safe(bucket_name)} error={_error_detail(e)}")
         raise
     logger.info(
-        f"Uploaded {len(file_content)} bytes to "
-        f"{bucket.name}/{_log_safe(object_name)}")
+        f"Uploaded {len(file_content)} bytes: "
+        f"object={_object_ref(object_name)} "
+        f"bucket={_log_safe(bucket_name)}")
     return blob.public_url
 
 
@@ -471,10 +700,26 @@ async def upload_file(file: UploadFile) -> str:
     # duplicating keeps one key-building and one error-handling path for both
     # entry points, and FastAPI may leave filename or content_type empty, so
     # both fall through to the defaults applied downstream.
+    #
+    # The delegate is OFFLOADED rather than called inline, and that is the
+    # whole point of this line. upload_attachment is synchronous by contract
+    # for the e-mail poller, and its blob.upload_from_string performs blocking
+    # socket I/O with a sixty-second default timeout. Called directly from
+    # this coroutine it would run ON the event-loop thread, where nothing else
+    # can be serviced while it waits: every other request in flight, every
+    # health probe and every keep-alive stalls for the duration of one
+    # merchant's document upload, and on Cloud Run a stalled container looks
+    # unhealthy. run_in_threadpool hands the call to Starlette's BOUNDED
+    # worker pool - bounded matters, since an unbounded one would trade a
+    # blocked loop for unbounded thread growth - so the loop returns to
+    # servicing other work immediately and resumes here when the upload
+    # finishes. The e-mail path is untouched: it still calls the synchronous
+    # function directly from its own thread, where blocking is correct.
     if file is None:
         raise ValueError("file is required to upload an attachment")
     file_content = await file.read()
-    return upload_attachment(file.filename, file_content, file.content_type)
+    return await run_in_threadpool(
+        upload_attachment, file.filename, file_content, file.content_type)
 
 
 def get_file_content(file_path: str) -> bytes:
@@ -483,20 +728,21 @@ def get_file_content(file_path: str) -> bytes:
     # raw bytes. A missing object is logged and RE-RAISED rather than
     # answered with empty bytes, because silently empty OCR input would
     # corrupt every downstream extraction instead of failing at the fault.
-    object_name = _resolve_object_name(file_path)
-    bucket = _get_bucket()
+    bucket_name = _get_bucket_name()
+    object_name = _resolve_object_name(file_path, bucket_name)
+    bucket = _get_bucket(bucket_name)
     blob = bucket.blob(object_name)
     try:
         return blob.download_as_bytes()
     except google_exceptions.NotFound as e:
         logger.error(
-            f"Object {_log_safe(object_name)} not found in "
-            f"{bucket.name}: {str(e)}")
+            f"Object not found: object={_object_ref(object_name)} "
+            f"bucket={_log_safe(bucket_name)} error={_error_detail(e)}")
         raise
     except google_exceptions.GoogleAPIError as e:
         logger.error(
-            f"Failed to download {_log_safe(object_name)} from "
-            f"{bucket.name}: {str(e)}")
+            f"Download failed: object={_object_ref(object_name)} "
+            f"bucket={_log_safe(bucket_name)} error={_error_detail(e)}")
         raise
 
 
@@ -505,22 +751,25 @@ def delete_file(file_path: str) -> None:
     # module that does not re-raise: an object that is already gone satisfies
     # the caller's intent, so a miss is a warning rather than a failure. Any
     # other API fault still surfaces.
-    object_name = _resolve_object_name(file_path)
-    bucket = _get_bucket()
+    bucket_name = _get_bucket_name()
+    object_name = _resolve_object_name(file_path, bucket_name)
+    bucket = _get_bucket(bucket_name)
     blob = bucket.blob(object_name)
     try:
         blob.delete()
     except google_exceptions.NotFound:
         logger.warning(
-            f"Object {_log_safe(object_name)} already absent from "
-            f"{bucket.name}")
+            f"Object already absent: object={_object_ref(object_name)} "
+            f"bucket={_log_safe(bucket_name)}")
         return
     except google_exceptions.GoogleAPIError as e:
         logger.error(
-            f"Failed to delete {_log_safe(object_name)} from "
-            f"{bucket.name}: {str(e)}")
+            f"Delete failed: object={_object_ref(object_name)} "
+            f"bucket={_log_safe(bucket_name)} error={_error_detail(e)}")
         raise
-    logger.info(f"Deleted {_log_safe(object_name)} from {bucket.name}")
+    logger.info(
+        f"Deleted: object={_object_ref(object_name)} "
+        f"bucket={_log_safe(bucket_name)}")
 
 
 def file_exists(file_path: str) -> bool:
@@ -528,8 +777,9 @@ def file_exists(file_path: str) -> bool:
     # callers branch on it without a try block. Genuine transport faults are
     # still logged and re-raised, so an unreachable bucket can never
     # masquerade as an absent object.
-    object_name = _resolve_object_name(file_path)
-    bucket = _get_bucket()
+    bucket_name = _get_bucket_name()
+    object_name = _resolve_object_name(file_path, bucket_name)
+    bucket = _get_bucket(bucket_name)
     blob = bucket.blob(object_name)
     try:
         return bool(blob.exists())
@@ -537,8 +787,8 @@ def file_exists(file_path: str) -> bool:
         return False
     except google_exceptions.GoogleAPIError as e:
         logger.error(
-            f"Failed to probe {_log_safe(object_name)} in "
-            f"{bucket.name}: {str(e)}")
+            f"Existence probe failed: object={_object_ref(object_name)} "
+            f"bucket={_log_safe(bucket_name)} error={_error_detail(e)}")
         raise
 
 
@@ -561,9 +811,10 @@ def generate_download_url(
         raise ValueError(
             "expiration_minutes must be between 1 and {0}".format(
                 MAX_EXPIRATION_MINUTES))
-    object_name = _resolve_object_name(file_path)
+    bucket_name = _get_bucket_name()
+    object_name = _resolve_object_name(file_path, bucket_name)
     signing_kwargs = _get_signing_kwargs()
-    bucket = _get_bucket()
+    bucket = _get_bucket(bucket_name)
     blob = bucket.blob(object_name)
     try:
         return blob.generate_signed_url(
@@ -580,6 +831,6 @@ def generate_download_url(
         # unauthorised signBlob call arrives as a GoogleAuthError, while a
         # storage-side fault arrives as a GoogleAPIError.
         logger.error(
-            f"Failed to sign a download URL for "
-            f"{_log_safe(object_name)}: {str(e)}")
+            f"Signing failed: object={_object_ref(object_name)} "
+            f"bucket={_log_safe(bucket_name)} error={_error_detail(e)}")
         raise
