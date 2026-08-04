@@ -33,7 +33,7 @@ pydantic==1.10.13
 # CVE-2024-53981 logging denial of service, and is the last release that
 # still installs on Python 3.9.
 python-multipart==0.0.20
-uvicorn==0.23.2           # ASGI server named in Dockerfile.backend line 20
+uvicorn==0.23.2           # ASGI server named in Dockerfile.backend line 30
 
 # Persistence
 # SQLAlchemy MUST be 2.x: app/db/models.py line 1 imports UUID from the
@@ -117,7 +117,7 @@ httpx==0.25.2      # backs the FastAPI TestClient at tests/test_api.py line 2
 #   ecdsa 0.19.2      unfixed upstream; the cryptography extra above keeps
 #                     it out of the code path
 # The interpreter's own packaging tools are audited with this tree but are
-# not resolved by it, so their floors live in Dockerfile.backend line 11:
+# not resolved by it, so their floors live in Dockerfile.backend lines 19-20:
 #   pip 26.0.1        three reports need pip 26.1 (py3.10). 26.0.1 is the
 #                     newest release inside this envelope and the floor the
 #                     image installs, which is where the three reports that
