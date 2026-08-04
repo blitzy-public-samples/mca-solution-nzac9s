@@ -1,21 +1,34 @@
 # Backend dependency manifest for Python 3.9, the runtime ci.yml line 19
 # and Dockerfile.backend line 2 declare, so every pin resolves inside that
 # envelope. Versions are exact because no lock file constrains them, and
-# some pins encode hard compatibility constraints a range would let a
-# resolver violate. What is declared is what this codebase requires across
-# runtime, deployment and test concerns, plus the one provider bound that an
-# extra leaves open; every other distribution is a resolver result.
+# the pins carry two kinds of bound a range would let a resolver violate:
+# hard compatibility constraints, and floors that keep known-vulnerable
+# releases out of the image. What is declared is what this codebase requires
+# across runtime, deployment and test concerns, plus the one provider bound
+# that an extra leaves open; every other distribution is a resolver result.
+# Advisories that survive because no remedy exists inside the Python 3.9
+# envelope are recorded at the end of this file rather than left implicit.
 
 # Web framework
 # pydantic MUST stay below 2.0: app/core/config.py line 1 imports
 # BaseSettings from pydantic, which 2.0 moved out to the separate
 # pydantic-settings package. This pin is what keeps config.py working
-# unedited; fastapi is held below 0.100 to match.
-fastapi==0.99.1
+# unedited, and it caps fastapi in turn - 0.119 and later drop pydantic v1
+# support, so 0.118.3 is the ceiling. Inside that ceiling fastapi is held
+# high enough to clear the CVE-2024-24762 Content-Type ReDoS, and 0.116.2
+# resolves starlette to 0.48.0, which clears CVE-2024-47874 and
+# CVE-2025-54121, two unauthenticated multipart denial-of-service vectors
+# on the upload route below. starlette itself stays unpinned: it is a
+# resolver result of this bound rather than a declared dependency.
+fastapi==0.116.2
 pydantic==1.10.13
 # python-multipart is mandatory, not optional: app/api/attachments.py line 10
 # declares UploadFile = File(...), and uploads reach FastAPI as form data.
-python-multipart==0.0.6
+# It therefore parses caller-supplied bodies, which makes its floor a
+# security bound as well: 0.0.20 clears the CVE-2024-24762 ReDoS and the
+# CVE-2024-53981 logging denial of service, and is the last release that
+# still installs on Python 3.9.
+python-multipart==0.0.20
 uvicorn==0.23.2           # ASGI server named in Dockerfile.backend line 20
 
 # Persistence
@@ -41,8 +54,11 @@ redis==5.0.1       # broker for CELERY_BROKER_URL at celery_tasks.py line 9
 # Security
 # The cryptography extra is load-bearing, not decorative: it is what
 # makes jose select its cryptography RSA and EC backends and leave the
-# bundled ecdsa one idle.
-python-jose[cryptography]==3.3.0   # JWT at security.py line 2
+# bundled ecdsa one idle. The floor is 3.4.0, which is where the
+# CVE-2024-33663 algorithm confusion, the CVE-2024-33664 JWE decompression
+# bomb and CVE-2024-29370 were all closed; 3.5.0 is the newest release
+# inside the Python 3.9 envelope and carries no advisory of its own.
+python-jose[cryptography]==3.5.0   # JWT at security.py line 2
 # The bcrypt extra names the backend CryptContext selects at security.py
 # line 8, but bounds it only at bcrypt>=3.1.0, so a clean resolve takes
 # bcrypt 5.0.0. passlib 1.7.4 finalises that backend by hashing an
@@ -50,18 +66,47 @@ python-jose[cryptography]==3.3.0   # JWT at security.py line 2
 # instead of truncating it: pip install and pip check both succeed while
 # the FIRST hash or verify raises ValueError. The pin below therefore
 # narrows passlib's own extra rather than adding a distribution, exactly
-# as the pydantic and SQLAlchemy bounds above narrow theirs. 4.0.1 was
-# measured, not guessed: it is the last release that both accepts the
-# probe and still exposes bcrypt.__about__, which passlib reads at
-# handlers/bcrypt.py line 620, so it is the only candidate that also
-# starts up without a trapped AttributeError traceback.
+# as the pydantic and SQLAlchemy bounds above narrow theirs. 4.0.1 is
+# measured, not preferred: bcrypt 4.1.0 dropped bcrypt.__about__, which
+# passlib reads at handlers/bcrypt.py line 620, so 4.1.0 through 4.3.0
+# hash and verify correctly but write 394 bytes of trapped AttributeError
+# traceback on first use where 4.0.1 writes none. No advisory separates
+# any of them, so a newer provider would buy noise and no security.
 passlib[bcrypt]==1.7.4             # CryptContext at security.py line 8
 bcrypt==4.0.1                      # provider of the passlib extra above
 
 # Utilities
-requests==2.31.0       # app/services/webhook_service.py line 1
+# requests 2.32.5 clears CVE-2024-35195, where a verify=False request
+# poisons a pooled connection, and the CVE-2024-47081 .netrc leak:
+# webhook_service.py line 33 posts to a URL read from the database with
+# trust_env at its default, which is that leak's precondition.
+requests==2.32.5       # app/services/webhook_service.py line 1
 python-dotenv==1.0.0   # backs env_file = ".env" at app/core/config.py line 15
 
 # Test tooling
 pytest==7.4.4      # invoked by ci.yml line 37
 httpx==0.25.2      # backs the FastAPI TestClient at tests/test_api.py line 2
+
+# Advisories left standing, recorded so the gap stays visible rather than
+# latent. Each was checked against this tree and none of them is reachable
+# by it; every one is cleared at once by moving off Python 3.9, which
+# ci.yml line 19 and Dockerfile.backend line 2 fix and this file cannot.
+#   starlette 0.48.0  six CVEs stand. CVE-2025-62727 needs 0.49.1, which
+#                     every fastapi compatible with pydantic v1 excludes
+#                     by declaring starlette<0.49.0; the other five need
+#                     starlette 1.x (py3.10). None is reachable here:
+#                     FileResponse, StaticFiles and TrustedHost are unused
+#   urllib3 2.6.3     CVE-2026-44431 and CVE-2026-44432 need 2.7.0 (py3.10)
+#   python-multipart  seven further reports need 0.0.22 or later (py3.10)
+#   requests 2.32.5   CVE-2026-25645 needs 2.33.0 (py3.10), and
+#                     extract_zipped_paths is unused here
+#   pytest 7.4.4      CVE-2025-71176 needs 9.0.3 (py3.10); pytest is test
+#                     tooling and never reaches the served image
+#   python-dotenv     CVE-2026-28684 needs 1.2.2 (py3.10), and set_key and
+#                     unset_key are unused here
+#   protobuf 4.25.9   the fix needs protobuf 5, which google-cloud-vision
+#                     3.5.0 excludes, and json_format is unused here
+#   click 8.1.8       the fix needs 8.3.3 (py3.10), and click.edit is
+#                     unused here
+#   ecdsa 0.19.2      unfixed upstream; the cryptography extra above keeps
+#                     it out of the code path
