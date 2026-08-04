@@ -13,14 +13,18 @@
 # pydantic MUST stay below 2.0: app/core/config.py line 1 imports
 # BaseSettings from pydantic, which 2.0 moved out to the separate
 # pydantic-settings package. This pin is what keeps config.py working
-# unedited, and it caps fastapi in turn - 0.119 and later drop pydantic v1
-# support, so 0.118.3 is the ceiling. Inside that ceiling fastapi is held
-# high enough to clear the CVE-2024-24762 Content-Type ReDoS, and 0.116.2
-# resolves starlette to 0.48.0, which clears CVE-2024-47874 and
-# CVE-2025-54121, two unauthenticated multipart denial-of-service vectors
-# on the upload route below. starlette itself stays unpinned: it is a
-# resolver result of this bound rather than a declared dependency.
-fastapi==0.116.2
+# unedited, and it caps fastapi in turn - 0.126.0 is the first release
+# that requires pydantic>=2.7.0, so 0.125.0 is the measured ceiling:
+# anything above it resolves to ResolutionImpossible against the pin
+# below. Held AT that ceiling, fastapi clears the CVE-2024-24762
+# Content-Type ReDoS and, because 0.125.0 widens its own bound to
+# starlette<0.51.0, resolves starlette to 0.49.3. That is what closes
+# CVE-2025-62727, the quadratic-time Range header merge in FileResponse,
+# on top of CVE-2024-47874 and CVE-2025-54121, two unauthenticated
+# multipart denial-of-service vectors on the upload route below.
+# starlette itself stays unpinned: it is a resolver result of this bound
+# rather than a declared dependency.
+fastapi==0.125.0
 pydantic==1.10.13
 # python-multipart is mandatory, not optional: app/api/attachments.py line 10
 # declares UploadFile = File(...), and uploads reach FastAPI as form data.
@@ -43,9 +47,15 @@ psycopg2-binary==2.9.9
 google-cloud-storage==2.14.0
 # google-cloud-vision stays on a release that publishes Image at the
 # package root: vision.types was removed in v2.0, and ocr_service.py
-# line 16 constructs vision.Image.
-google-cloud-vision==3.5.0
-google-cloud-logging==3.9.0    # app/core/logging.py line 2 imports its Client
+# line 16 constructs vision.Image. Both clients are then held at the
+# newest release inside the Python 3.9 envelope, because vision 3.5.0 and
+# logging 3.9.0 declared protobuf<5 and so capped protobuf at 4.25.9.
+# The two below declare protobuf>=4.25.8,<8.0.0, which lets the resolver
+# take protobuf 6.33.6 and closes CVE-2026-0994, the recursion-limit
+# bypass in json_format.ParseDict. protobuf stays unpinned for the same
+# reason starlette does: it is a resolver result of these bounds.
+google-cloud-vision==3.14.0
+google-cloud-logging==3.15.0   # app/core/logging.py line 2 imports its Client
 
 # Task queue
 celery==5.3.4      # app/tasks/celery_tasks.py line 1
@@ -91,9 +101,7 @@ httpx==0.25.2      # backs the FastAPI TestClient at tests/test_api.py line 2
 # latent. Each was checked against this tree and none of them is reachable
 # by it; every one is cleared at once by moving off Python 3.9, which
 # ci.yml line 19 and Dockerfile.backend line 2 fix and this file cannot.
-#   starlette 0.48.0  six CVEs stand. CVE-2025-62727 needs 0.49.1, which
-#                     every fastapi compatible with pydantic v1 excludes
-#                     by declaring starlette<0.49.0; the other five need
+#   starlette 0.49.3  five CVEs stand, every one of them fixed only in
 #                     starlette 1.x (py3.10). None is reachable here:
 #                     FileResponse, StaticFiles and TrustedHost are unused
 #   urllib3 2.6.3     CVE-2026-44431 and CVE-2026-44432 need 2.7.0 (py3.10)
@@ -104,9 +112,16 @@ httpx==0.25.2      # backs the FastAPI TestClient at tests/test_api.py line 2
 #                     tooling and never reaches the served image
 #   python-dotenv     CVE-2026-28684 needs 1.2.2 (py3.10), and set_key and
 #                     unset_key are unused here
-#   protobuf 4.25.9   the fix needs protobuf 5, which google-cloud-vision
-#                     3.5.0 excludes, and json_format is unused here
 #   click 8.1.8       the fix needs 8.3.3 (py3.10), and click.edit is
 #                     unused here
 #   ecdsa 0.19.2      unfixed upstream; the cryptography extra above keeps
 #                     it out of the code path
+# The interpreter's own packaging tools are audited with this tree but are
+# not resolved by it, so their floors live in Dockerfile.backend line 11:
+#   pip 26.0.1        three reports need pip 26.1 (py3.10). 26.0.1 is the
+#                     newest release inside this envelope and the floor the
+#                     image installs, which is where the three reports that
+#                     the base image's pip 23.0.1 did carry were closed
+#   setuptools 79.0.1 CVE-2026-59890 needs 83.0.0 (py3.10); it bypasses
+#                     MANIFEST.in exclusion when building an sdist on macOS
+#                     APFS or HFS+ only, and no sdist is built here
