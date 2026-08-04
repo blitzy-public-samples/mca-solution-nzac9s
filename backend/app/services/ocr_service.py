@@ -1,5 +1,4 @@
 from google.cloud import vision
-from google.cloud.vision import types
 from app.core.config import get_settings
 from app.services.storage_service import get_file_content
 
@@ -12,7 +11,9 @@ def process_document(file_path: str) -> str:
     client = vision.ImageAnnotatorClient()
 
     # Perform OCR on the document
-    image = types.Image(content=file_content)
+    # vision.types was removed in google-cloud-vision 2.0; Image now lives
+    # on the package root. Same message type, same constructor arguments.
+    image = vision.Image(content=file_content)
     response = client.document_text_detection(image=image)
 
     # Extract and concatenate text from OCR result

@@ -7,8 +7,18 @@ WORKDIR /app
 # Copy the requirements file into the container
 COPY requirements.txt .
 
-# Install the required packages
-RUN pip install --no-cache-dir -r requirements.txt
+# Install the required packages. The base image on line 2 ships pip 23.0.1 and
+# wheel 0.45.1, and wheel 0.45.1 carries CVE-2026-24049: its unpack command
+# chmods the path recorded in the archive instead of the extracted one, so a
+# crafted wheel rewrites permissions on files outside the target directory.
+# Both tools are therefore raised before the manifest is installed, each to the
+# newest release inside the Python 3.9 envelope line 2 fixes - wheel 0.47.0 is
+# past the 0.46.2 fix and carries no advisory, and pip 26.0.1 closes the three
+# advisories pip 23.0.1 carries that have a Python 3.9 remedy at all. Neither
+# is an application dependency, so neither belongs in requirements.txt.
+RUN python -m pip install --no-cache-dir --upgrade "pip==26.0.1" \
+ && python -m pip install --no-cache-dir --upgrade "wheel==0.47.0" \
+ && pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code into the container
 COPY ./app /app
